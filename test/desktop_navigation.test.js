@@ -17,7 +17,7 @@ test('GitHub uses the native right tab group and opts into hide without disablin
   const pane = entries.find(entry => entry.area === 'panes')
   assert.equal(pane.title, 'GitHub')
   assert.equal(pane.data.placement, 'right')
-  assert.equal(pane.data.dock, undefined)
+  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center' })
   assert.equal(pane.data.closeBehavior, 'hide')
   assert.ok(pane.data.revealAliases.includes('github'))
 })
@@ -52,6 +52,21 @@ test('reopening prefers the public SDK reveal action', () => {
   } finally {
     host.revealPane = oldReveal
   }
+})
+
+test('titlebar toggles through the host independently of explicit Open', () => {
+  const entry = contributions().find(entry => entry.id === 'titlebar-github')
+  const component = entry.render()
+  const button = component.type(component.props)
+  const toggles = []
+  const oldToggle = host.togglePane
+  host.togglePane = id => toggles.push(id)
+  try {
+    assert.equal(button.props['aria-label'], 'GitHub')
+    button.props.onClick()
+    button.props.onClick()
+    assert.deepEqual(toggles, ['githermes:pane', 'githermes:pane'])
+  } finally { host.togglePane = oldToggle }
 })
 
 test('legacy reopening requests open rather than toggle or plugin enable', () => {

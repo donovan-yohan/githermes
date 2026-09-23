@@ -1383,19 +1383,20 @@ function StatePill({ d }) {
 }
 
 function TitlebarGithubButton() {
-  return jsx(Tip, {
-    label: 'Open GitHub pane',
-    children: jsx(Button, {
-      variant: 'ghost',
-      size: 'sm',
-      onClick: openGithubPane,
-      children: jsxs('span', {
-        className: 'flex items-center gap-1.5',
-        children: [
-          jsx(Codicon, { name: 'github' }),
-          jsx('span', { className: 'hidden sm:inline text-xs font-medium', children: 'GitHub' }),
-        ],
-      }),
+  return jsx(Button, {
+    variant: 'ghost',
+    size: 'sm',
+    'aria-label': 'GitHub',
+    onClick: () => {
+      if (typeof host.togglePane === 'function') host.togglePane(PANE_ID)
+      else openGithubPane()
+    },
+    children: jsxs('span', {
+      className: 'flex items-center gap-1.5',
+      children: [
+        jsx(Codicon, { name: 'github' }),
+        jsx('span', { className: 'hidden sm:inline text-xs font-medium', children: 'GitHub' }),
+      ],
     }),
   })
 }
@@ -3997,8 +3998,9 @@ export default {
       area: PANES_AREA,
       title: 'GitHub',
       data: {
-        // Join the host's right-hand tab group; do not create a separate split.
+        // Default to native Files tabs; never enforce over a saved layout.
         placement: 'right',
+        dock: { pane: 'files', pos: 'center' },
         closeBehavior: 'hide',
         width: '440px',
         revealAliases: [PANE_ID, 'github'],
