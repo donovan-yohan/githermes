@@ -173,6 +173,12 @@ test('integrated render never dispatches commands or autosends; queries require 
   api.GitHubInbox({ active: true }); assert.equal(opts.enabled, true)
   assert.ok(nodes(tree).some(n => n.props?.children === 'Ask Hermes · draft'))
   assert.ok(!nodes(tree).some(n => n.props?.target === '_blank'))
+  const labels = nodes(tree).filter(n => n.type === 'label')
+  for (const field of ['Repositories', 'Organization']) {
+    assert.ok(labels.some(n => n.props.children[0] === field && n.props.children[1].props['aria-label'] === field))
+  }
+  assert.ok(!nodes(tree).some(n => n.props?.title), 'inbox does not add explanatory tooltips')
+  assert.ok(!tree.props.children.some(n => n?.type === 'p' && !n.props.role), 'only runtime status and errors use top-level prose blocks')
   delete globalThis.__ghTestQuery
 })
 

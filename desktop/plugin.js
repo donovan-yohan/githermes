@@ -3765,19 +3765,16 @@ export function GitHubInbox({ active = true } = {}) {
   return jsxs('section', { 'aria-label': 'GitHub inbox', style: { display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%', gap: 12, padding: 12, color: 'var(--ui-text-primary)' }, children: [
     jsxs('header', { style: actions, children: [jsx('strong', { children: 'GitHub Inbox' }), jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || query.isFetching || mutation.isPending, onClick: () => { assertInboxContext(identity); if (active) query.refetch() }, children: query.isFetching ? 'Refreshing…' : 'Refresh' })] }),
     jsx(SegmentedControl, { value: filters.view, onChange: view => change({ view }), options: [{ id: 'notifications', label: 'Notifications' }, { id: 'reviews', label: 'Needs your review' }] }),
-    jsx('p', { style: muted, children: filters.view === 'reviews' ? 'Open PRs currently requesting your review, across repositories. This is a live search, not notification history; it does not include every team-only request.' : 'Notification history is not a live review queue. Reading or marking a thread done does not submit a PR review. All includes read threads, not a complete Done archive.' }),
     filters.view === 'notifications' ? jsx(SegmentedControl, { value: filters.read, onChange: read => change({ read }), options: [{ id: 'unread', label: 'Unread' }, { id: 'all', label: 'All' }] }) : null,
     filters.view === 'notifications' ? jsx(Select, { value: filters.reason, onValueChange: reason => change({ reason }), children: [jsx(SelectTrigger, { 'aria-label': 'Notification reason', children: jsx(SelectValue, {}) }), jsx(SelectContent, { children: [['all', 'All reasons'], ['assign', 'Assigned'], ['mention', 'Mentioned'], ['team_mention', 'Team mentioned'], ['review_requested', 'Review requested (including teams)']].map(([value, label]) => jsx(SelectItem, { value, children: label }, value)) })] }) : null,
-    jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal('https://github.com/notifications'), children: 'Open full GitHub inbox · Saved / Done / Participating' }),
-    jsx('p', { style: muted, children: 'Saved, Done archive and the full Participating filter are available on GitHub; this bounded REST view does not reproduce them.' }),
+    jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal('https://github.com/notifications'), children: 'Open inbox on GitHub' }),
     jsxs('form', { style: { display: 'flex', flexDirection: 'column', gap: 8 }, onSubmit: event => { event.preventDefault(); try { change({ repositories: repos, organization: org }); setFilterError('') } catch (error) { setFilterError(error.message) } }, children: [
-      jsx(Input, { 'aria-label': 'Repositories, comma separated', placeholder: 'owner/repo, owner/another (up to 5)', value: repos, onChange: event => setRepos(event.target.value) }),
-      jsx(Input, { 'aria-label': 'Organization', placeholder: 'Organization (optional)', value: org, onChange: event => setOrg(event.target.value) }),
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Repositories', jsx(Input, { 'aria-label': 'Repositories', placeholder: 'owner/repo, owner/another', value: repos, onChange: event => setRepos(event.target.value) })] }),
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Organization', jsx(Input, { 'aria-label': 'Organization', value: org, onChange: event => setOrg(event.target.value) })] }),
       jsx(Button, { type: 'submit', variant: 'secondary', size: 'sm', children: 'Apply filters' }),
       filterError ? jsx('p', { role: 'alert', style: muted, children: filterError }) : null,
     ] }),
-    filters.view === 'notifications' && filters.organization && !filters.repositories.length ? jsx('p', { style: muted, children: 'Organization is filtered from a bounded account-wide scan; older matching threads may be outside it. Select repositories for a targeted scan.' }) : null,
-    jsx('p', { role: 'status', style: muted, children: gateway !== 'open' ? 'Connect to a Hermes gateway to load GitHub.' : query.isPending ? 'Loading inbox…' : inboxCountLabel(query.data) }),
+    jsx('p', { role: 'status', style: muted, children: gateway !== 'open' ? 'Disconnected' : query.isPending ? 'Loading inbox…' : inboxCountLabel(query.data) }),
     query.error || mutation.error ? jsx('p', { role: 'alert', style: muted, children: String((mutation.error || query.error).message) }) : null,
     mutation.data ? jsx('p', { role: 'status', style: muted, children: mutation.data }) : null,
     jsx(ScrollArea, { style: { flex: 1, minHeight: 0 }, children: jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 }, children: [
@@ -3790,14 +3787,14 @@ export function GitHubInbox({ active = true } = {}) {
           jsxs('div', { style: actions, children: [
             url ? jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal(url), children: 'Open GitHub' }) : jsx('span', { style: muted, children: 'No canonical item link available' }),
             url ? jsx(CopyButton, { text: url, label: 'Copy GitHub link', appearance: 'icon', buttonSize: 'icon-sm' }) : null,
-            jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, title: 'Insert a draft into the active conversation; never sends', onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item, filters.view)) }, children: 'Ask Hermes · draft' }),
+            jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item, filters.view)) }, children: 'Ask Hermes · draft' }),
             notification && item.unread ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => mutation.mutate({ id: item.id, action: 'read', identity }), children: 'Mark read' }) : null,
             notification ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => setConfirmDone(item.id), children: 'Done…' }) : null,
           ] }),
-          confirmDone === item.id ? jsxs('div', { style: actions, children: [jsx('span', { style: muted, children: 'Remove this thread from the inbox (GitHub Done)?' }), jsx(Button, { variant: 'secondary', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => mutation.mutate({ id: item.id, action: 'done', identity }), children: 'Mark done' }), jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => setConfirmDone(null), children: 'Cancel' })] }) : null,
+          confirmDone === item.id ? jsxs('div', { style: actions, children: [jsx('span', { style: muted, children: 'Mark done?' }), jsx(Button, { variant: 'secondary', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => mutation.mutate({ id: item.id, action: 'done', identity }), children: 'Mark done' }), jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => setConfirmDone(null), children: 'Cancel' })] }) : null,
         ] }, String(item.id))
       }),
-      query.data && !query.data.items.length ? jsx('p', { style: muted, children: query.data.partial ? 'No matches within this scan. Narrow to repositories or open GitHub for the full inbox.' : 'No matching items returned by GitHub.' }) : null,
+      query.data && !query.data.items.length ? jsx('p', { style: muted, children: query.data.partial ? 'No matches · Partial results' : 'No matching items' }) : null,
     ] }) }),
   ] })
 }
