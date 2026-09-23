@@ -637,6 +637,15 @@ export async function readChunksConcurrently(byteLength, readChunk, options = {}
   return chunks.join('')
 }
 
+export function decodeShellPayload(out) {
+  const encoded = out.replace(/\s+/g, '')
+  if (encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new Error('GitHub transport error: response altered or truncated by host.')
+  }
+  const bin = atob(encoded)
+  return new TextDecoder('utf-8').decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
+}
+
 async function shBig(cmd, guard) {
   const tag = `ghprs.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
   const raw = `/tmp/${tag}.raw`, b64 = `/tmp/${tag}.b64`
@@ -647,8 +656,7 @@ async function shBig(cmd, guard) {
       byteLength,
       off => sh(`tail -c +${off} ${sq(b64)} | head -c 3800`, guard),
     )
-    const bin = atob(out.replace(/\s+/g, ''))
-    return new TextDecoder('utf-8').decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
+    return decodeShellPayload(out)
   } finally {
     sh(`unlink ${sq(raw)}; unlink ${sq(b64)}`, guard).catch(() => {})
   }
