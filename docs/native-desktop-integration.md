@@ -30,6 +30,14 @@ Copy-link actions use canonical GitHub browser URLs, not REST API URLs. Ask Herm
 
 References: [GitHub notifications API](https://docs.github.com/en/rest/activity/notifications) and [Managing the GitHub inbox](https://docs.github.com/en/subscriptions-and-notifications/how-tos/viewing-and-triaging-notifications/managing-notifications-from-your-inbox).
 
+## Refresh semantics
+
+Inbox refresh uses the desktop SDK's shared QueryClient (no manual interval loop). **Needs your review** re-runs its live search every 60 seconds while its pane/page is active, the gateway is `open`, and the desktop window is foregrounded. Hiding the pane, disconnecting, backgrounding the window, or unmounting stops periodic work. Returning to a stale view or window refetches it; a fresh cache is reused.
+
+Notifications retain `X-Poll-Interval` from `gh api --include`. Their next poll waits at least the largest server interval across every page/repository in the bounded scan, with a conservative 60-second minimum. Stale-on-focus/reconnect uses the same interval, not an unconditional 60-second threshold. A changed header adjusts the next timer. If any response omits the header or supplies an invalid/overflowing interval, periodic notification polling is disabled; stale-on-focus (after 60 seconds) and the explicit **Refresh** action remain available. Periodic refresh stops after errors, with no automatic retry loop; errors stay visible and focus/manual refresh can recover. Explicit Refresh and post-mutation invalidation are user-triggered refreshes, not periodic polls.
+
+Already-dispatched gateway commands cannot be canceled by hiding the pane. Connection/profile identity guards still fence every subsequent transport dispatch; cached queries remain identity- and filter-scoped. Polling does not expand pagination caps or make bounded scans complete.
+
 ## Verification boundaries
 
 Node tests exercise plugin contribution declarations, navigation actions, pure logic, and component contracts using test-only SDK stubs. They do not establish rendered parity or installed Electron behavior. The companion host tests exercise the actual tree store and contribution registry. Release verification must additionally exercise an actual Desktop renderer: close/reopen, retained sidebar navigation, tab grouping, layout persistence, narrow widths, and light/dark appearance.

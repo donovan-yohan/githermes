@@ -2,6 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import * as api from '../desktop/plugin.js'
 const plain = value => JSON.parse(JSON.stringify(value))
+const notificationResponse = (items, seconds = '60') => `HTTP/2.0 200 OK\r\nx-poll-interval: ${seconds}\r\n\r\n${JSON.stringify(items)}`
+const loadInbox = (filters, read) => api.loadGitHubInbox(filters, async cmd => {
+  const data = await read(cmd)
+  return Array.isArray(data) ? notificationResponse(data) : data
+})
 const thread = (id, repo = 'acme/app', extra = {}) => ({ id: String(id), unread: true, updated_at: '2026-01-01T00:00:00Z', repository: { full_name: repo }, subject: { title: 'Example', url: 'https://api.github.com/repos/acme/app/pulls/42' }, ...extra })
 
 test('filter keys normalize ordering and include view/read/organization/identity', () => {
@@ -40,9 +45,28 @@ test('draft contains only stable canonical link, not untrusted title instruction
   assert.equal(api.inboxDraft({}), '')
 })
 
+test('notifications preserve the slowest GitHub poll header across pages and repositories', async () => {
+  let calls = 0
+  const result = await api.loadGitHubInbox({ repositories: 'acme/a,acme/b' }, async cmd => {
+    assert.match(cmd, /--include/)
+    calls++
+    return notificationResponse(calls === 1 ? Array.from({ length: 50 }, (_, i) => thread(i)) : [], calls === 2 ? '180' : '90')
+  })
+  assert.equal(calls, 3)
+  assert.equal(result.pollIntervalMs, 180_000)
+  for (const header of ['', '0', '-1', 'oops', '1.5', '9999999999999999']) {
+    const invalid = await api.loadGitHubInbox({}, async () => notificationResponse([], header))
+    assert.equal(invalid.pollIntervalMs, null, 'unknown/invalid interval must not assume 60s is allowed')
+  }
+  const mixed = await api.loadGitHubInbox({ repositories: 'acme/a,acme/b' }, async cmd => notificationResponse([], cmd.includes('acme/a') ? '120' : ''))
+  assert.equal(mixed.pollIntervalMs, null)
+  const missing = await api.loadGitHubInbox({}, async () => 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n[]')
+  assert.equal(missing.pollIntervalMs, null)
+})
+
 test('notification pagination is bounded and labels a full last page conservatively', async () => {
   const calls = []
-  const result = await api.loadGitHubInbox({}, async command => { calls.push(command); return Array.from({ length: 50 }, (_, i) => thread(i + calls.length * 50)) })
+  const result = await loadInbox({}, async command => { calls.push(command); return Array.from({ length: 50 }, (_, i) => thread(i + calls.length * 50)) })
   assert.equal(calls.length, 3)
   assert.equal(result.items.length, 150)
   assert.equal(result.scanned, 150)
@@ -53,7 +77,7 @@ test('notification pagination is bounded and labels a full last page conservativ
 
 test('multi-repository requests use exact endpoints, dedupe rows, preserve read/all', async () => {
   const calls = []
-  const result = await api.loadGitHubInbox({ repositories: 'acme/a,acme/b', read: 'all' }, async command => {
+  const result = await loadInbox({ repositories: 'acme/a,acme/b', read: 'all' }, async command => {
     calls.push(command)
     return [thread(1, 'acme/a'), thread(1, 'acme/a'), thread(2, 'acme/b')]
   })
@@ -66,7 +90,7 @@ test('multi-repository requests use exact endpoints, dedupe rows, preserve read/
 })
 
 test('organization filtering reports scanned versus matched, not fictitious total', async () => {
-  const result = await api.loadGitHubInbox({ organization: 'acme' }, async () => [thread(1), thread(2, 'other/app')])
+  const result = await loadInbox({ organization: 'acme' }, async () => [thread(1), thread(2, 'other/app')])
   assert.equal(result.items.length, 1)
   assert.equal(result.scanned, 2)
   assert.equal(api.inboxCountLabel(result), '1 matching · 2 notifications scanned')
@@ -74,14 +98,14 @@ test('organization filtering reports scanned versus matched, not fictitious tota
 
 test('disjoint repository/organization selection never fetches unrelated data', async () => {
   for (const view of ['reviews', 'notifications']) {
-    const result = await api.loadGitHubInbox({ repositories: 'other/app', organization: 'acme', view }, async () => assert.fail('must not fetch'))
+    const result = await loadInbox({ repositories: 'other/app', organization: 'acme', view }, async () => assert.fail('must not fetch'))
     assert.equal(result.items.length, 0)
   }
 })
 
 test('review pagination preserves total and incomplete_results independently', async () => {
   let calls = 0
-  const result = await api.loadGitHubInbox({ view: 'reviews' }, async command => {
+  const result = await loadInbox({ view: 'reviews' }, async command => {
     calls++
     assert.match(command, /review-requested:@me/)
     return { total_count: 500, incomplete_results: false, items: Array.from({ length: 50 }, (_, i) => ({ id: i + calls * 50, repository_url: 'https://api.github.com/repos/acme/app' })) }
@@ -90,14 +114,14 @@ test('review pagination preserves total and incomplete_results independently', a
   assert.equal(result.total, 500)
   assert.equal(result.items.length, 150)
   assert.equal(result.partial, true)
-  const incomplete = await api.loadGitHubInbox({ view: 'reviews' }, async () => ({ total_count: 0, incomplete_results: true, items: [] }))
+  const incomplete = await loadInbox({ view: 'reviews' }, async () => ({ total_count: 0, incomplete_results: true, items: [] }))
   assert.equal(incomplete.partial, true)
 })
 
 test('invalid API responses and permission failures remain errors, not empty success', async () => {
-  await assert.rejects(api.loadGitHubInbox({}, async () => null), /Invalid GitHub/)
-  await assert.rejects(api.loadGitHubInbox({ view: 'reviews' }, async () => ({})), /Invalid GitHub/)
-  await assert.rejects(api.loadGitHubInbox({}, async () => { throw new Error('HTTP 403') }), /403/)
+  await assert.rejects(loadInbox({}, async () => null), /Invalid GitHub/)
+  await assert.rejects(loadInbox({ view: 'reviews' }, async () => ({})), /Invalid GitHub/)
+  await assert.rejects(loadInbox({}, async () => { throw new Error('HTTP 403') }), /403/)
 })
 
 test('mutation plan is per-thread only, with explicit supported methods', () => {
@@ -173,7 +197,7 @@ test('exact thread verification and Done caveat prevent false success', async ()
 
 test('literal notification reason filters include team review requests', async () => {
   for (const reason of ['assign', 'mention', 'team_mention', 'review_requested']) {
-    const result = await api.loadGitHubInbox({ reason }, async () => [thread(1, 'acme/app', { reason }), thread(2, 'acme/app', { reason: 'subscribed' })])
+    const result = await loadInbox({ reason }, async () => [thread(1, 'acme/app', { reason }), thread(2, 'acme/app', { reason: 'subscribed' })])
     assert.equal(result.items.length, 1)
     assert.notDeepEqual(api.inboxQueryKey({ reason }), api.inboxQueryKey({}))
   }

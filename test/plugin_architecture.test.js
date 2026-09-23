@@ -30,8 +30,8 @@ test('Paginated REST walks are capped and newest-first for comments', () => {
 })
 
 test('Issue #34: polling is tiered, focus-aware and paused with the pane', () => {
-  assert.equal((source.match(/refetchIntervalInBackground/g) || []).length, 0)
-  assert.equal((source.match(/refetchOnWindowFocus: true/g) || []).length, 8)
+  assert.equal((source.match(/refetchIntervalInBackground:\s*true/g) || []).length, 0)
+  assert.equal((source.match(/refetchOnWindowFocus: true/g) || []).length, 9)
   assert.ok(source.includes("refetchInterval: q => livePollInterval(headerQ.data, { kind: 'checks', checks: q.state.data })"))
   assert.equal((source.match(/livePollInterval\(headerQ\.data, \{ kind: 'slow' \}\)/g) || []).length, 2)
   assert.ok(source.includes("const paneVisible = useValue(typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID) : $alwaysVisible)"))

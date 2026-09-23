@@ -3648,8 +3648,26 @@ export function inboxCountLabel(result) {
   return `${count} matching · ${result.scanned} notifications scanned${result.partial ? ' · scan limit reached; more may exist' : ''}`
 }
 
+// Preserve gh's HTTP headers for notifications; search keeps the JSON transport.
+function readInboxResponse(cmd, guard) {
+  return cmd.includes(' --include ') ? shBig(cmd, guard) : shJsonBig(cmd, guard)
+}
+
+function parseInboxNotifications(response) {
+  const match = typeof response === 'string' && response.match(/^HTTP\/\S+ 200[^\r\n]*\r?\n([\s\S]*?)\r?\n\r?\n([\s\S]*)$/)
+  if (!match) throw new Error('Invalid GitHub notifications response.')
+  let items
+  try { items = JSON.parse(match[2]) } catch { throw new Error('Invalid GitHub notifications JSON.') }
+  if (!Array.isArray(items)) throw new Error('Invalid GitHub notifications response.')
+  const value = match[1].match(/^x-poll-interval:[ \t]*(\d+)[ \t]*$/im)?.[1]
+  const ms = Number(value) * 1000
+  // Fail closed if no safe timer can honor GitHub's minimum (including overflow).
+  const pollIntervalMs = Number.isSafeInteger(ms) && ms > 0 && ms <= 2_147_483_647 ? Math.max(60_000, ms) : null
+  return { items, pollIntervalMs }
+}
+
 // Injectable transport keeps bounded pagination behavior testable without GitHub writes.
-export async function loadGitHubInbox(input, read = shJsonBig) {
+export async function loadGitHubInbox(input, read = readInboxResponse) {
   const f = inboxFilters(input)
   const items = new Map()
   let scanned = 0, partial = false, total = 0
@@ -3673,17 +3691,20 @@ export async function loadGitHubInbox(input, read = shJsonBig) {
   }
   const repos = f.repositories.filter(r => !f.organization || r.split('/')[0] === f.organization)
   const endpoints = f.repositories.length ? repos.map(r => `repos/${r}/notifications`) : ['notifications']
+  let pollIntervalMs = 60_000
   for (const endpoint of endpoints) {
     for (let page = 1; page <= INBOX_PAGE_CAP; page++) {
-      const data = await read(`${GH} api --hostname github.com --method GET ${sq(`${endpoint}?all=${f.read === 'all'}&per_page=${INBOX_PAGE_SIZE}&page=${page}`)} --jq ${sq('[.[]|{id,unread,reason,updated_at,subject:{title:.subject.title,type:.subject.type,url:.subject.url},repository:{full_name:.repository.full_name}}]')}`)
-      if (!Array.isArray(data)) throw new Error('Invalid GitHub notifications response.')
+      const response = await read(`${GH} api --hostname github.com --method GET --include ${sq(`${endpoint}?all=${f.read === 'all'}&per_page=${INBOX_PAGE_SIZE}&page=${page}`)} --jq ${sq('[.[]|{id,unread,reason,updated_at,subject:{title:.subject.title,type:.subject.type,url:.subject.url},repository:{full_name:.repository.full_name}}]')}`)
+      const parsed = parseInboxNotifications(response)
+      const data = parsed.items
+      pollIntervalMs = pollIntervalMs === null || parsed.pollIntervalMs === null ? null : Math.max(pollIntervalMs, parsed.pollIntervalMs)
       scanned += data.length
       for (const item of data) if (inboxMatchesRepository(item.repository?.full_name, f) && (f.reason === 'all' || item.reason === f.reason)) items.set(String(item.id), { ...item, repo: item.repository.full_name })
       if (data.length < INBOX_PAGE_SIZE) break
       if (page === INBOX_PAGE_CAP) partial = true
     }
   }
-  return { kind: 'notifications', items: [...items.values()].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))), scanned, partial }
+  return { kind: 'notifications', items: [...items.values()].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))), scanned, partial, pollIntervalMs: endpoints.length ? pollIntervalMs : null }
 }
 
 export function inboxIdentity(api = host) {
@@ -3708,6 +3729,23 @@ export async function mutateInboxThread({ id, action, identity }, transport = {}
   return action === 'done' ? 'Done request accepted. The thread was read back, but this API does not expose a Done flag; confirm its archive state on GitHub.' : 'Thread confirmed read.'
 }
 
+export function inboxQueryOptions(filters, identity, active, gateway) {
+  return {
+    queryKey: inboxQueryKey(filters, identity),
+    queryFn: () => loadGitHubInbox(filters, cmd => readInboxResponse(cmd, () => assertInboxContext(identity))),
+    enabled: active && gateway === 'open',
+    staleTime: query => filters.view === 'reviews' ? 60_000 : query.state.data?.pollIntervalMs || 60_000,
+    // QueryClient owns timers/deduplication; errors require focus or explicit retry.
+    refetchInterval: query => {
+      if (!active || gateway !== 'open' || query.state.status === 'error') return false
+      return filters.view === 'reviews' ? 60_000 : query.state.data?.pollIntervalMs || false
+    },
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+    retry: false,
+  }
+}
+
 export function GitHubInbox({ active = true } = {}) {
   const gateway = useValue(host.state.gateway)
   const connectionId = useValue(host.state.connectionId)
@@ -3719,7 +3757,7 @@ export function GitHubInbox({ active = true } = {}) {
   const [filterError, setFilterError] = useState('')
   const [confirmDone, setConfirmDone] = useState(null)
   const identity = JSON.stringify([connectionId, profile])
-  const query = useQuery({ queryKey: inboxQueryKey(filters, identity), queryFn: () => loadGitHubInbox(filters, cmd => shJsonBig(cmd, () => assertInboxContext(identity))), enabled: active && gateway === 'open', staleTime: 60_000, refetchOnWindowFocus: false, retry: false })
+  const query = useQuery(inboxQueryOptions(filters, identity, active, gateway))
   const mutation = useMutation({ mutationFn: mutateInboxThread, retry: false, onSuccess: () => { setConfirmDone(null) }, onSettled: () => queryClient.invalidateQueries({ queryKey: ['githermes', 'inbox'] }) })
   const change = patch => { setFilters(old => inboxFilters({ ...old, ...patch })); setConfirmDone(null) }
   const muted = { color: 'var(--ui-text-secondary)', fontSize: '.75rem', margin: 0 }
