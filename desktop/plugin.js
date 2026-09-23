@@ -3590,223 +3590,207 @@ function RepositoryPage() {
   })
 }
 
+export function classifyInboxPull(pr) {
+  if (pr.state !== 'OPEN') return []
+  const buckets = (pr.sources || []).filter(s => s === 'direct' || s === 'team')
+  const owned = pr.sources?.some(s => s === 'authored' || s === 'assigned')
+  if (!owned) return buckets
+  if (pr.isDraft) return pr.sources.includes('authored') ? [...buckets, 'drafts'] : buckets
+  const commit = pr.commits?.nodes?.[0]?.commit
+  const checks = commit?.statusCheckRollup?.state
+  if (pr.reviewDecision === 'CHANGES_REQUESTED' || pr.mergeable === 'CONFLICTING' || ['FAILURE', 'ERROR'].includes(checks)) return [...buckets, 'action']
+  // CLEAN is GitHub's positive aggregate merge-state verdict (required checks included).
+  // Never infer readiness from an absent/conflicting/unknown merge verdict.
+  if (pr.isDraft === false && pr.mergeable === 'MERGEABLE' && pr.mergeStateStatus === 'CLEAN' &&
+      (pr.reviewDecision === 'APPROVED' || pr.reviewDecision === null) && commit &&
+      (checks === 'SUCCESS' || commit.statusCheckRollup === null)) return [...buckets, 'ready']
+  if (pr.reviewDecision === 'REVIEW_REQUIRED' || pr.reviewRequests?.nodes?.length) return [...buckets, 'waiting']
+  return buckets
+}
+
 const INBOX_PAGE_SIZE = 50
 const INBOX_PAGE_CAP = 3
+export const INBOX_SECTIONS = [
+  ['direct', 'Needs your review'], ['team', 'Needs your teams review'],
+  ['action', 'Needs action'], ['ready', 'Ready to merge'],
+  ['drafts', 'Your drafts'], ['waiting', 'Waiting for review'],
+]
+const INBOX_VIEWS = [['inbox', 'Inbox'], ['authored', 'Authored by me'], ['assigned', 'Assigned to me'], ['involves', 'Involves me'], ['reviews', 'Review requested']]
+const INBOX_SEARCHES = { authored: 'author:@me', assigned: 'assignee:@me', involves: 'involves:@me', direct: 'user-review-requested:@me', team: 'team-review-requested-user:@me' }
 
 export function inboxFilters(input = {}) {
   const repos = Array.isArray(input.repositories) ? input.repositories : String(input.repositories || '').split(/[\s,]+/)
   const repositories = [...new Set(repos.map(r => String(r).trim().toLowerCase()).filter(Boolean))].sort()
-  if (repositories.length > 5) throw new Error('Choose up to five repositories per inbox view.')
-  if (repositories.some(r => !/^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/.test(r) || ['.', '..'].includes(r.split('/')[1]))) throw new Error('Use owner/repository names, separated by commas.')
+  if (repositories.length > 5) throw new Error('Maximum five repositories')
+  if (repositories.some(r => !/^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/.test(r) || ['.', '..'].includes(r.split('/')[1]))) throw new Error('Invalid owner/repository')
   const organization = String(input.organization || '').trim().toLowerCase()
-  if (organization && !/^[a-z0-9][a-z0-9-]*$/.test(organization)) throw new Error('Use an organization login, not a URL.')
-  const reason = ['assign', 'mention', 'team_mention', 'review_requested', 'all'].includes(input.reason) ? input.reason : 'all'
-  return { reason, view: input.view === 'reviews' ? 'reviews' : 'notifications', read: input.read === 'all' ? 'all' : 'unread', repositories, organization }
+  if (organization && !/^[a-z0-9][a-z0-9-]*$/.test(organization)) throw new Error('Invalid organization')
+  return { view: INBOX_VIEWS.some(([v]) => v === input.view) ? input.view : 'inbox', repositories, organization, updated: ['1', '7', '30', '90'].includes(String(input.updated)) ? String(input.updated) : 'all' }
 }
-
 export function inboxQueryKey(filters, identity = '') {
   const f = inboxFilters(filters)
-  return ['githermes', 'inbox', identity, f.view, f.read, f.reason, f.organization, f.repositories.join(',')]
+  return ['githermes', 'inbox', identity, f.view, f.updated, f.organization, f.repositories.join(',')]
 }
-
 export function inboxMatchesRepository(repo, filters) {
   const r = String(repo || '').toLowerCase()
   return (!filters.repositories.length || filters.repositories.includes(r)) && (!filters.organization || r.split('/')[0] === filters.organization)
 }
-
-export function inboxReviewSearch(filters) {
+export function inboxSearch(filters, source, now = new Date()) {
   const f = inboxFilters(filters)
+  if (!INBOX_SEARCHES[source]) throw new Error('Invalid PR view')
   const repos = f.repositories.filter(r => !f.organization || r.split('/')[0] === f.organization)
   if (f.repositories.length && !repos.length) return null
-  return ['is:pr', 'is:open', 'review-requested:@me', ...repos.map(r => `repo:${r}`), ...(!repos.length && f.organization ? [`org:${f.organization}`] : [])].join(' ')
+  const updated = f.updated === 'all' ? [] : [`updated:>=${new Date(now.getTime() - Number(f.updated) * 86400000).toISOString()}`]
+  return ['is:pr', 'is:open', INBOX_SEARCHES[source], ...repos.map(r => `repo:${r}`), ...(!repos.length && f.organization ? [`org:${f.organization}`] : []), ...updated, 'sort:updated-desc'].join(' ')
 }
-
-// Only canonical item URLs; an API thread URL is not a browser destination.
-// Unsupported subjects intentionally get no invented item link.
 export function inboxItemUrl(item) {
-  const direct = item.html_url
-  if (typeof direct === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues|discussions)\/\d+(?:#[-\w]+)?$/.test(direct)) return direct
-  const url = item.subject?.url || ''
-  const m = url.match(/^https:\/\/api\.github\.com\/repos\/([\w.-]+\/[\w.-]+)\/(pulls|issues|commits)\/([a-zA-Z0-9]+)$/)
-  if (!m) return ''
-  if (m[2] !== 'commits' && !/^\d+$/.test(m[3])) return ''
-  if (m[2] === 'commits' && !/^[a-fA-F0-9]{7,40}$/.test(m[3])) return ''
-  return `https://github.com/${m[1]}/${({ pulls: 'pull', issues: 'issues', commits: 'commit' })[m[2]]}/${m[3]}`
+  const url = item.url || item.html_url || ''
+  return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(url) ? url : ''
 }
-
-export function inboxDraft(item, view = 'notifications') {
+export function inboxDraft(item) {
   const url = inboxItemUrl(item)
-  if (!url) return ''
-  return view === 'reviews'
-    ? `Help me review this requested pull request: ${url}\nInspect the changes and suggest review feedback. Do not submit a review or change GitHub state without my confirmation.`
-    : `Help me triage this GitHub item: ${url}\nExplain what needs my attention. Do not change GitHub state without my confirmation.`
+  return url ? `Help me review this pull request: ${url}\nInspect the changes and suggest next steps. Do not submit a review or change GitHub state without my confirmation.` : ''
 }
-
-export function inboxThreadCommand(id, action) {
-  if (!/^\d+$/.test(String(id))) throw new Error('Invalid notification thread ID.')
-  const method = ({ read: 'PATCH', done: 'DELETE' })[action]
-  if (!method) throw new Error('Unsupported notification action.')
-  return `${GH} api --hostname github.com --method ${method} ${sq(`notifications/threads/${id}`)} --silent`
-}
-
 export function inboxCountLabel(result) {
-  if (!result) return ''
-  const count = result.items.length
-  if (result.kind === 'reviews') return `${count} loaded · ${result.total} search matches${result.partial ? ' · partial results' : ''}`
-  return `${count} matching · ${result.scanned} notifications scanned${result.partial ? ' · scan limit reached; more may exist' : ''}`
+  return result ? [`${result.items.length} loaded`, ...(result.statuses || [])].join(' · ') : ''
 }
 
-// Preserve gh's HTTP headers for notifications; search keeps the JSON transport.
-function readInboxResponse(cmd, guard) {
-  return cmd.includes(' --include ') ? shBig(cmd, guard) : shJsonBig(cmd, guard)
+// Structured read-only request seam; an account-aware backend can inject this transport.
+export const INBOX_GRAPHQL = `query GitHermesInbox($search: String!, $cursor: String) {
+  search(query: $search, type: ISSUE, first: ${INBOX_PAGE_SIZE}, after: $cursor) {
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      id number title url state isDraft updatedAt mergeable mergeStateStatus reviewDecision
+      repository { nameWithOwner } author { login }
+      reviewRequests(first: 100) { pageInfo { hasNextPage } nodes { requestedReviewer {
+        __typename ... on User { login } ... on Team { slug organization { login } }
+      } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    } }
+  }
+}`
+export async function readInboxRequest(request, guard) {
+  if (request.kind !== 'graphql' || request.query !== INBOX_GRAPHQL) throw new Error('Unsupported PR request')
+  guard?.()
+  const command = `${GH} api --hostname github.com graphql -f ${sq(`query=${request.query}`)} -f ${sq(`search=${request.variables.search}`)}${request.variables.cursor ? ` -f ${sq(`cursor=${request.variables.cursor}`)}` : ''}`
+  const result = await shJsonBig(command, guard)
+  guard?.()
+  return result
 }
-
-function parseInboxNotifications(response) {
-  const match = typeof response === 'string' && response.match(/^HTTP\/\S+ 200[^\r\n]*\r?\n([\s\S]*?)\r?\n\r?\n([\s\S]*)$/)
-  if (!match) throw new Error('Invalid GitHub notifications response.')
-  let items
-  try { items = JSON.parse(match[2]) } catch { throw new Error('Invalid GitHub notifications JSON.') }
-  if (!Array.isArray(items)) throw new Error('Invalid GitHub notifications response.')
-  const value = match[1].match(/^x-poll-interval:[ \t]*(\d+)[ \t]*$/im)?.[1]
-  const ms = Number(value) * 1000
-  // Fail closed if no safe timer can honor GitHub's minimum (including overflow).
-  const pollIntervalMs = Number.isSafeInteger(ms) && ms > 0 && ms <= 2_147_483_647 ? Math.max(60_000, ms) : null
-  return { items, pollIntervalMs }
-}
-
-// Injectable transport keeps bounded pagination behavior testable without GitHub writes.
-export async function loadGitHubInbox(input, read = readInboxResponse) {
-  const f = inboxFilters(input)
-  const items = new Map()
-  let scanned = 0, partial = false, total = 0
-  if (f.view === 'reviews') {
-    const q = inboxReviewSearch(f)
-    if (q === null) return { kind: 'reviews', items: [], total: 0, scanned: 0, partial: false }
-    for (let page = 1; page <= INBOX_PAGE_CAP; page++) {
-      const data = await read(`${GH} api --hostname github.com --method GET search/issues -f ${sq(`q=${q}`)} -f sort=updated -f order=desc -f per_page=${INBOX_PAGE_SIZE} -f page=${page} --jq ${sq('{total_count,incomplete_results,items:[.items[]|{id,number,title,html_url,repository_url}]}')}`)
-      if (!data || !Array.isArray(data.items) || !Number.isInteger(data.total_count)) throw new Error('Invalid GitHub search response.')
-      total = data.total_count
-      partial ||= !!data.incomplete_results
-      scanned += data.items.length
-      for (const item of data.items) {
-        const repo = String(item.repository_url || '').replace('https://api.github.com/repos/', '')
-        if (inboxMatchesRepository(repo, f)) items.set(String(item.id), { ...item, repo })
+export async function loadGitHubInbox(input, read = readInboxRequest, now = new Date()) {
+  const f = inboxFilters(input), items = new Map(), statuses = new Set()
+  const sources = f.view === 'inbox' ? ['direct', 'team', 'authored', 'assigned'] : f.view === 'reviews' ? ['direct', 'team'] : [f.view]
+  let partial = false
+  for (const source of sources) {
+    const search = inboxSearch(f, source, now)
+    if (search === null) continue
+    let cursor = null
+    try {
+      for (let page = 0; page < INBOX_PAGE_CAP; page++) {
+        const response = await read({ kind: 'graphql', query: INBOX_GRAPHQL, variables: { search, cursor } })
+        if (response?.errors?.length) throw new Error('GitHub PR query failed')
+        const data = response?.data?.search
+        if (!data || !Array.isArray(data.nodes) || !Number.isInteger(data.issueCount) || typeof data.pageInfo?.hasNextPage !== 'boolean') throw new Error('Invalid GitHub PR response')
+        for (const pr of data.nodes) {
+          if (!pr?.id || !pr.repository?.nameWithOwner || !inboxItemUrl(pr) || !['OPEN', 'CLOSED', 'MERGED'].includes(pr.state)) throw new Error('Invalid GitHub PR node')
+          if (!inboxMatchesRepository(pr.repository.nameWithOwner, f) || pr.state !== 'OPEN') continue
+          const previous = items.get(pr.id)
+          items.set(pr.id, { ...pr, repo: pr.repository.nameWithOwner, sources: [...new Set([...(previous?.sources || []), source])] })
+          if (pr.reviewRequests?.pageInfo?.hasNextPage) { partial = true; statuses.add('Review requests truncated') }
+        }
+        if (!data.pageInfo.hasNextPage) break
+        if (!data.pageInfo.endCursor || data.pageInfo.endCursor === cursor || page === INBOX_PAGE_CAP - 1) { partial = true; break }
+        cursor = data.pageInfo.endCursor
       }
-      if (data.items.length < INBOX_PAGE_SIZE || scanned >= total) break
-      if (page === INBOX_PAGE_CAP) partial = true
-    }
-    return { kind: 'reviews', items: [...items.values()], total, scanned, partial }
-  }
-  const repos = f.repositories.filter(r => !f.organization || r.split('/')[0] === f.organization)
-  const endpoints = f.repositories.length ? repos.map(r => `repos/${r}/notifications`) : ['notifications']
-  let pollIntervalMs = 60_000
-  for (const endpoint of endpoints) {
-    for (let page = 1; page <= INBOX_PAGE_CAP; page++) {
-      const response = await read(`${GH} api --hostname github.com --method GET --include ${sq(`${endpoint}?all=${f.read === 'all'}&per_page=${INBOX_PAGE_SIZE}&page=${page}`)} --jq ${sq('[.[]|{id,unread,reason,updated_at,subject:{title:.subject.title,type:.subject.type,url:.subject.url},repository:{full_name:.repository.full_name}}]')}`)
-      const parsed = parseInboxNotifications(response)
-      const data = parsed.items
-      pollIntervalMs = pollIntervalMs === null || parsed.pollIntervalMs === null ? null : Math.max(pollIntervalMs, parsed.pollIntervalMs)
-      scanned += data.length
-      for (const item of data) if (inboxMatchesRepository(item.repository?.full_name, f) && (f.reason === 'all' || item.reason === f.reason)) items.set(String(item.id), { ...item, repo: item.repository.full_name })
-      if (data.length < INBOX_PAGE_SIZE) break
-      if (page === INBOX_PAGE_CAP) partial = true
+    } catch (error) {
+      // Supported team search avoids guessing membership from mentions/notifications.
+      // Denied/unsupported search cannot be represented as an empty complete team queue.
+      if (source !== 'team' || error.code === 'INBOX_CONTEXT_CHANGED' || error.name === 'AbortError') throw error
+      partial = true; statuses.add('Team reviews unavailable')
     }
   }
-  return { kind: 'notifications', items: [...items.values()].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))), scanned, partial, pollIntervalMs: endpoints.length ? pollIntervalMs : null }
+  const rows = [...items.values()].sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))).map(pr => ({ ...pr, buckets: classifyInboxPull(pr) }))
+  if (partial) statuses.add('Partial results')
+  if (f.view === 'inbox' && rows.some(pr => !pr.buckets.length)) statuses.add('Unclassified PRs')
+  return { kind: 'pulls', items: rows, partial, statuses: [...statuses] }
 }
-
 export function inboxIdentity(api = host) {
   return JSON.stringify([api.state.connectionId.get(), api.state.profile.get()])
 }
-
 export function assertInboxContext(identity, api = host) {
   if (api.state.gateway.get() !== 'open' || inboxIdentity(api) !== identity) {
-    throw new Error('GitHub context changed or disconnected. No further commands sent; an already submitted action may have completed. Refresh in the original context before retrying.')
+    const error = new Error('GitHub context changed or disconnected')
+    error.code = 'INBOX_CONTEXT_CHANGED'
+    throw error
   }
 }
-
-export async function mutateInboxThread({ id, action, identity }, transport = {}) {
-  const guard = () => assertInboxContext(identity, transport.api || host)
-  guard()
-  await (transport.write || sh)(inboxThreadCommand(id, action), guard)
-  guard()
-  const thread = await (transport.read || shJson)(`${GH} api --hostname github.com ${sq(`notifications/threads/${id}`)} --jq ${sq('{id,unread}')}`, guard)
-  guard()
-  if (String(thread?.id) !== String(id)) throw new Error('Action submitted, but exact thread readback was not verified. Check GitHub before retrying.')
-  if (action === 'read' && thread?.unread !== false) throw new Error('GitHub has not confirmed the thread as read. Refresh before retrying.')
-  return action === 'done' ? 'Done request accepted. The thread was read back, but this API does not expose a Done flag; confirm its archive state on GitHub.' : 'Thread confirmed read.'
-}
-
-export function inboxQueryOptions(filters, identity, active, gateway) {
+export function inboxQueryOptions(filters, identity, active, gateway, read = readInboxRequest) {
   return {
     queryKey: inboxQueryKey(filters, identity),
-    queryFn: () => loadGitHubInbox(filters, cmd => readInboxResponse(cmd, () => assertInboxContext(identity))),
-    enabled: active && gateway === 'open',
-    staleTime: query => filters.view === 'reviews' ? 60_000 : query.state.data?.pollIntervalMs || 60_000,
-    // QueryClient owns timers/deduplication; errors require focus or explicit retry.
-    refetchInterval: query => {
-      if (!active || gateway !== 'open' || query.state.status === 'error') return false
-      return filters.view === 'reviews' ? 60_000 : query.state.data?.pollIntervalMs || false
-    },
-    refetchIntervalInBackground: false,
-    refetchOnWindowFocus: true,
-    retry: false,
+    queryFn: () => loadGitHubInbox(filters, async request => {
+      const guard = () => assertInboxContext(identity)
+      guard(); const result = await read(request, guard); guard(); return result
+    }),
+    enabled: active && gateway === 'open', staleTime: 60_000,
+    refetchInterval: query => active && gateway === 'open' && query.state.status !== 'error' ? 60_000 : false,
+    refetchIntervalInBackground: false, refetchOnWindowFocus: true, retry: false,
   }
 }
 
-export function GitHubInbox({ active = true } = {}) {
+export function GitHubInbox({ active = true, read = readInboxRequest } = {}) {
   const gateway = useValue(host.state.gateway)
   const connectionId = useValue(host.state.connectionId)
   const profile = useValue(host.state.profile)
   const sessionId = useValue(host.state.activeSessionId)
   const [filters, setFilters] = useState(() => inboxFilters())
-  const [repos, setRepos] = useState('')
-  const [org, setOrg] = useState('')
+  const [repos, setRepos] = useState(''), [org, setOrg] = useState('')
   const [filterError, setFilterError] = useState('')
-  const [confirmDone, setConfirmDone] = useState(null)
   const identity = JSON.stringify([connectionId, profile])
-  const query = useQuery(inboxQueryOptions(filters, identity, active, gateway))
-  const mutation = useMutation({ mutationFn: mutateInboxThread, retry: false, onSuccess: () => { setConfirmDone(null) }, onSettled: () => queryClient.invalidateQueries({ queryKey: ['githermes', 'inbox'] }) })
-  const change = patch => { setFilters(old => inboxFilters({ ...old, ...patch })); setConfirmDone(null) }
-  const muted = { color: 'var(--ui-text-secondary)', fontSize: '.75rem', margin: 0 }
-  const actions = { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }
-  return jsxs('section', { 'aria-label': 'GitHub inbox', style: { display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%', gap: 12, padding: 12, color: 'var(--ui-text-primary)' }, children: [
-    jsxs('header', { style: actions, children: [jsx('strong', { children: 'GitHub Inbox' }), jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || query.isFetching || mutation.isPending, onClick: () => { assertInboxContext(identity); if (active) query.refetch() }, children: query.isFetching ? 'Refreshing…' : 'Refresh' })] }),
-    jsx(SegmentedControl, { value: filters.view, onChange: view => change({ view }), options: [{ id: 'notifications', label: 'Notifications' }, { id: 'reviews', label: 'Needs your review' }] }),
-    filters.view === 'notifications' ? jsx(SegmentedControl, { value: filters.read, onChange: read => change({ read }), options: [{ id: 'unread', label: 'Unread' }, { id: 'all', label: 'All' }] }) : null,
-    filters.view === 'notifications' ? jsx(Select, { value: filters.reason, onValueChange: reason => change({ reason }), children: [jsx(SelectTrigger, { 'aria-label': 'Notification reason', children: jsx(SelectValue, {}) }), jsx(SelectContent, { children: [['all', 'All reasons'], ['assign', 'Assigned'], ['mention', 'Mentioned'], ['team_mention', 'Team mentioned'], ['review_requested', 'Review requested (including teams)']].map(([value, label]) => jsx(SelectItem, { value, children: label }, value)) })] }) : null,
-    jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal('https://github.com/notifications'), children: 'Open inbox on GitHub' }),
-    jsxs('form', { style: { display: 'flex', flexDirection: 'column', gap: 8 }, onSubmit: event => { event.preventDefault(); try { change({ repositories: repos, organization: org }); setFilterError('') } catch (error) { setFilterError(error.message) } }, children: [
-      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Repositories', jsx(Input, { 'aria-label': 'Repositories', placeholder: 'owner/repo, owner/another', value: repos, onChange: event => setRepos(event.target.value) })] }),
-      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Organization', jsx(Input, { 'aria-label': 'Organization', value: org, onChange: event => setOrg(event.target.value) })] }),
-      jsx(Button, { type: 'submit', variant: 'secondary', size: 'sm', children: 'Apply filters' }),
-      filterError ? jsx('p', { role: 'alert', style: muted, children: filterError }) : null,
+  const query = useQuery(inboxQueryOptions(filters, identity, active, gateway, read))
+  const change = patch => setFilters(old => inboxFilters({ ...old, ...patch }))
+  const rows = query.data?.items || []
+  const row = item => {
+    const url = inboxItemUrl(item)
+    return jsxs('article', { className: 'flex flex-col gap-1 border-b border-(--ui-stroke-tertiary) py-2', children: [
+      jsx('strong', { className: 'text-sm break-words', children: item.title }),
+      jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: `${item.repo || item.repository?.nameWithOwner} #${item.number} · ${item.isDraft ? 'Draft' : item.reviewDecision === 'CHANGES_REQUESTED' ? 'Changes requested' : item.mergeStateStatus || 'Status unknown'}` }),
+      jsxs('div', { className: 'flex flex-wrap items-center gap-1', children: [
+        jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url, onClick: () => openExternal(url), children: 'Open GitHub' }),
+        url ? jsx(CopyButton, { text: url, label: 'Copy GitHub link', appearance: 'icon', buttonSize: 'icon-sm' }) : null,
+        jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item)) }, children: 'Ask Hermes · draft' }),
+      ] }),
+    ] }, item.id)
+  }
+  return jsxs('section', { 'aria-label': 'Pull request inbox', className: 'flex h-full min-h-0 flex-col gap-3 p-3 text-(--ui-text-primary)', children: [
+    jsxs('header', { className: 'flex flex-wrap items-center gap-2', children: [
+      jsx('strong', { children: 'Pull request inbox' }),
+      jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || query.isFetching, onClick: () => { assertInboxContext(identity); if (active) query.refetch() }, children: query.isFetching ? 'Refreshing…' : 'Refresh' }),
+      jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal('https://github.com/pulls/inbox'), children: 'Open inbox on GitHub' }),
     ] }),
-    jsx('p', { role: 'status', style: muted, children: gateway !== 'open' ? 'Disconnected' : query.isPending ? 'Loading inbox…' : inboxCountLabel(query.data) }),
-    query.error || mutation.error ? jsx('p', { role: 'alert', style: muted, children: String((mutation.error || query.error).message) }) : null,
-    mutation.data ? jsx('p', { role: 'status', style: muted, children: mutation.data }) : null,
-    jsx(ScrollArea, { style: { flex: 1, minHeight: 0 }, children: jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 }, children: [
-      ...(query.data?.items || []).map(item => {
-        const url = inboxItemUrl(item)
-        const notification = filters.view === 'notifications'
-        return jsxs('article', { style: { display: 'flex', flexDirection: 'column', gap: 6, overflowWrap: 'anywhere' }, children: [
-          jsx('strong', { children: item.title || item.subject?.title || 'Untitled notification' }),
-          jsx('p', { style: muted, children: `${item.repo}${notification ? ` · ${item.reason} · ${item.unread ? 'unread' : 'read'}` : ' · review requested'}` }),
-          jsxs('div', { style: actions, children: [
-            url ? jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal(url), children: 'Open GitHub' }) : jsx('span', { style: muted, children: 'No canonical item link available' }),
-            url ? jsx(CopyButton, { text: url, label: 'Copy GitHub link', appearance: 'icon', buttonSize: 'icon-sm' }) : null,
-            jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item, filters.view)) }, children: 'Ask Hermes · draft' }),
-            notification && item.unread ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => mutation.mutate({ id: item.id, action: 'read', identity }), children: 'Mark read' }) : null,
-            notification ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => setConfirmDone(item.id), children: 'Done…' }) : null,
-          ] }),
-          confirmDone === item.id ? jsxs('div', { style: actions, children: [jsx('span', { style: muted, children: 'Mark done?' }), jsx(Button, { variant: 'secondary', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => mutation.mutate({ id: item.id, action: 'done', identity }), children: 'Mark done' }), jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || mutation.isPending, onClick: () => setConfirmDone(null), children: 'Cancel' })] }) : null,
-        ] }, String(item.id))
-      }),
-      query.data && !query.data.items.length ? jsx('p', { style: muted, children: query.data.partial ? 'No matches · Partial results' : 'No matching items' }) : null,
-    ] }) }),
+    jsx(SegmentedControl, { value: filters.view, onChange: view => change({ view }), options: INBOX_VIEWS.map(([id, label]) => ({ id, label })) }),
+    jsxs('form', { className: 'flex flex-col gap-2', onSubmit: e => { e.preventDefault(); try { change({ repositories: repos, organization: org }); setFilterError('') } catch (error) { setFilterError(error.message) } }, children: [
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Repositories', jsx(Input, { 'aria-label': 'Repositories', placeholder: 'owner/repo, owner/another', value: repos, onChange: e => setRepos(e.target.value) })] }),
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Organization', jsx(Input, { 'aria-label': 'Organization', value: org, onChange: e => setOrg(e.target.value) })] }),
+      jsx(Select, { value: filters.updated, onValueChange: updated => change({ updated }), children: [jsx(SelectTrigger, { 'aria-label': 'Updated', children: jsx(SelectValue, {}) }), jsx(SelectContent, { children: [['all', 'Any update'], ['1', 'Updated in 24 hours'], ['7', 'Updated in 7 days'], ['30', 'Updated in 30 days'], ['90', 'Updated in 90 days']].map(([value, label]) => jsx(SelectItem, { value, children: label }, value)) })] }),
+      jsx(Button, { type: 'submit', variant: 'secondary', size: 'sm', children: 'Apply filters' }),
+    ] }),
+    jsx('span', { role: 'status', className: 'text-xs text-(--ui-text-secondary)', children: gateway !== 'open' ? 'Disconnected' : query.isPending ? 'Loading…' : inboxCountLabel(query.data) }),
+    filterError || query.error ? jsx('span', { role: 'alert', className: 'text-xs', children: filterError || query.error.message }) : null,
+    jsx(ScrollArea, { className: 'flex-1 min-h-0', children: filters.view === 'inbox'
+      ? jsxs('div', { children: [
+          ...INBOX_SECTIONS.map(([id, label]) => {
+            const matches = rows.filter(pr => pr.buckets.includes(id))
+            return jsxs('details', { open: true, className: 'border-b border-(--ui-stroke-tertiary) py-2', children: [
+              jsx('summary', { className: 'cursor-pointer text-sm font-medium', children: `${label} · ${matches.length}` }),
+              ...matches.map(row),
+            ] }, id)
+          }),
+          ...rows.filter(pr => !pr.buckets.length).map(row),
+        ] })
+      : jsx('div', { children: rows.length ? rows.map(row) : jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: query.data?.partial ? 'No matches · Partial results' : 'No matching pull requests' }) }),
+    }),
   ] })
 }
-
 
 export function setGitHubMode(mode) {
   const value = mode === 'inbox' ? 'inbox' : 'repository'

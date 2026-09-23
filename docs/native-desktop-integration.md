@@ -18,25 +18,11 @@ Existing user-customized layouts remain authoritative. Changing the default plac
 
 Use the actual Hermes SDK controls, not lookalike components. Native badges, status dots, buttons, checkboxes, empty states, and popovers own their geometry and semantic colors. Custom list, diff, and timeline composition uses host tokens without overriding SDK internals. Repository label names remain visible and filterable; arbitrary repository label colors do not override the active theme.
 
-## Inbox scope and API limits
+## Pull request inbox
 
-The Inbox combines notifications with a separate live search for open pull requests requesting the authenticated user's review. Notification reasons are historical signals: `review_requested` can include team requests and does not establish that a review is still pending. The live personal-review search is deliberately labeled separately.
+Inbox is the cross-repository pull request dashboard at `https://github.com/pulls/inbox`, not notifications. It has six collapsible PR sections, authored/assigned/involves/review views, repository/organization/update filters, canonical link copying and insert-only draft handoff. The old notifications API and read/Done mutations have been removed.
 
-Repository and organization filters must report the scope actually searched. Account-wide notification scans are bounded; organization filtering can exclude newer results without reaching older matching threads. Show truncation explicitly rather than presenting the loaded count as a total. Targeted repository endpoints reduce that gap.
-
-The public REST notifications API does not offer full parity with the web inbox's Saved/Done archive views. Keep a link to the full GitHub inbox for unsupported views. Mark-read actions require exact-thread readback. A successful Done request is not proof of archive state: thread GET does not expose a Done flag.
-
-Copy-link actions use canonical GitHub browser URLs, not REST API URLs. Ask Hermes inserts a draft only. Opening the panel, filtering, and rendering must never mutate GitHub state or submit a chat message.
-
-References: [GitHub notifications API](https://docs.github.com/en/rest/activity/notifications) and [Managing the GitHub inbox](https://docs.github.com/en/subscriptions-and-notifications/how-tos/viewing-and-triaging-notifications/managing-notifications-from-your-inbox).
-
-## Refresh semantics
-
-Inbox refresh uses the desktop SDK's shared QueryClient (no manual interval loop). **Needs your review** re-runs its live search every 60 seconds while its pane/page is active, the gateway is `open`, and the desktop window is foregrounded. Hiding the pane, disconnecting, backgrounding the window, or unmounting stops periodic work. Returning to a stale view or window refetches it; a fresh cache is reused.
-
-Notifications retain `X-Poll-Interval` from `gh api --include`. Their next poll waits at least the largest server interval across every page/repository in the bounded scan, with a conservative 60-second minimum. Stale-on-focus/reconnect uses the same interval, not an unconditional 60-second threshold. A changed header adjusts the next timer. If any response omits the header or supplies an invalid/overflowing interval, periodic notification polling is disabled; stale-on-focus (after 60 seconds) and the explicit **Refresh** action remain available. Periodic refresh stops after errors, with no automatic retry loop; errors stay visible and focus/manual refresh can recover. Explicit Refresh and post-mutation invalidation are user-triggered refreshes, not periodic polls.
-
-Already-dispatched gateway commands cannot be canceled by hiding the pane. Connection/profile identity guards still fence every subsequent transport dispatch; cached queries remain identity- and filter-scoped. Polling does not expand pagination caps or make bounded scans complete.
+See [PR inbox](pr-inbox.md) for official sources, exact public-API classification rules, account transport seam, refresh behavior and explicit parity limits. Unknown mergeability is never ready; denied team searches and bounded results are labeled rather than presented as complete.
 
 ## Verification boundaries
 
