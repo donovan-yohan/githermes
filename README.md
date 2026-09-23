@@ -33,6 +33,11 @@ A single-file desktop plugin (`@hermes/plugin-sdk`) that shows your repository's
 
 ## Requirements
 
+> **Desktop compatibility:** Keeping GitHub navigation after closing its pane requires the companion host patch implementing `closeBehavior: 'hide'`. Older desktops may disable the plugin on Close; installing this plugin alone does not fix that host behavior. See [native desktop integration](docs/native-desktop-integration.md).
+
+Repository / Inbox mode is shared between the pane and page and persisted. Inbox provides bounded notification scans, literal reason filters, multi-repository / organization scope, and a separate live **Needs your review** search. Saved, Done archive and full Participating parity remain on GitHub via **Open full GitHub inbox**; REST does not expose a verified Done flag. Notification review requests include team requests; the personal live search is not a complete team review queue.
+
+
 - Hermes Desktop
 - [`gh`](https://cli.github.com/) installed and authenticated (`gh auth status`)
 

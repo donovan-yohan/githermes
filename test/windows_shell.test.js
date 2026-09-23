@@ -22,11 +22,12 @@ test('shell: every gh/hermes invocation resolves the binary per platform', () =>
 test('shell: every shell.exec goes through the shellCommand wrapper', () => {
   // A raw `host.request('shell.exec', { command: cmd })` call site bypasses the
   // Windows bash hop and reintroduces the cmd.exe bug for that one query.
-  const calls = source.match(/host\.request\('shell\.exec', \{ command: [^}]*\}/g) || []
+  const calls = source.match(/host\.request\('shell\.exec', \{ command(?:: [^}]*| )\}/g) || []
+  assert.match(source, /const command = await shellCommand\(cmd\)\s+guard\(\)[^\n]*\n\s+const r = await host.request\('shell.exec', \{ command \}\)/)
   assert.ok(calls.length >= 4, 'expected the wrapper callers, the where-git probe and the bash probe')
   for (const call of calls) {
     const ok =
-      call.includes('shellCommand(') ||
+      call.includes('shellCommand(') || call === "host.request('shell.exec', { command }" ||
       call.includes("'where git'") ||
       call.includes('if exist')
     assert.ok(ok, `unwrapped shell.exec call site: ${call}`)
