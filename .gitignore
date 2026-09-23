@@ -1,3 +1,6 @@
 node_modules
 .worktrees
 .serena
+__pycache__/
+.pytest_cache/
+*.pyc

@@ -45,13 +45,14 @@ test('links and drafts accept canonical PR URLs only', () => {
   assert.equal(api.inboxDraft({}), '')
 })
 test('mode remains reachable without repository discovery in pane and page', () => {
-  context(); globalThis.__ghTestQuery = () => assert.fail('no discovery in shell')
+  context(); api.githubAccountState.set({ context: JSON.stringify(['local', 'ebi']), login: 'alpha', ready: true, generation: 1, epoch: 1 }); globalThis.__ghTestQuery = () => assert.fail('no discovery in shell')
   try {
     api.setGitHubMode('inbox')
     for (const page of [false, true]) {
       const all = nodes(api.GitHubSurface({ page }))
       assert.ok(all.some(n => n.type === SegmentedControl && n.props.options.some(o => o.id === 'inbox')))
-      assert.equal(all.find(n => n.type === api.GitHubInbox).key, JSON.stringify(['local', 'ebi']))
+      assert.ok(all.some(n => n.key === JSON.stringify(['local', 'ebi', 'alpha', 1])))
+      assert.ok(all.some(n => n.type === api.GitHubInbox))
     }
   } finally { delete globalThis.__ghTestQuery }
 })

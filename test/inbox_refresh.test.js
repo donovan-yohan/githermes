@@ -29,6 +29,7 @@ function renderedOptions(active = true, gateway = 'open') {
   host.state.connectionId = atom('refresh-test')
   host.state.profile = atom('test')
   host.state.activeSessionId = atom('session')
+  api.githubAccountState.set({ context: JSON.stringify(['refresh-test', 'test']), login: 'alpha', ready: true, generation: 1, epoch: 1 })
   let options
   globalThis.__ghTestQuery = value => { options = value; return { data: undefined } }
   try { api.GitHubInbox({ active }) } finally { delete globalThis.__ghTestQuery }

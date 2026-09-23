@@ -1,0 +1,10 @@
+{
+  "name": "githermes",
+  "label": "GitHermes",
+  "version": "0.6.0",
+  "description": "Private profile-scoped GitHub operations",
+  "tab": {"hidden": true},
+  "slots": [],
+  "entry": "index.js",
+  "api": "plugin_api.py"
+}

@@ -21,7 +21,7 @@ const files = {
     main: './index.js',
   },
   'node_modules/@hermes/plugin-sdk/index.js': `export const host = { state: { activeSessionId: {} }, request: async () => ({ code: 0, stdout: '' }) }
-export const atom = (init) => ({ get: () => init, set: value => { init = value } })
+export const atom = (init) => { const listeners = new Set(); return { get: () => init, set: value => { if (value === init) return; init = value; listeners.forEach(fn => fn(value)) }, listen: fn => { listeners.add(fn); return () => listeners.delete(fn) } } }
 export const useValue = value => value?.get?.() ?? null
 export const useQuery = options => globalThis.__ghTestQuery?.(options) ?? ({ isLoading: false, isError: false, data: null })
 export const useMutation = () => ({ mutate: () => {}, isPending: false, error: null })

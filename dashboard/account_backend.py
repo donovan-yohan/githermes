@@ -1,41 +1,85 @@
-"""Private GitHub subprocess execution. No shell, auth switching, or token responses.
-
-This module deliberately has no HTTP entrypoint: mount only a validated operation API,
-not arbitrary argv. The caller must bind a profile's explicit GH_CONFIG_DIR and apply
-Hermes output redaction before returning GitHub content to the desktop.
-"""
+"""Private, bounded GitHub subprocess execution. No global auth changes."""
 import json
 import os
 import re
 import subprocess
+import threading
+
+MAX_OUTPUT = 4 * 1024 * 1024
+COMMAND_TIMEOUT = 45
 
 
 class AccountError(RuntimeError):
-    """Safe, fixed-message error: never attach subprocess output or exceptions."""
+    """Fixed safe messages only; never attach child output or exceptions."""
 
 
 class AccountExecutor:
-    def __init__(self, executable, config_dir):
-        if not os.path.isabs(executable) or not os.path.isabs(config_dir):
+    def __init__(self, executable, config_dir, home=None):
+        home = home or config_dir
+        if not all(os.path.isabs(p) for p in (executable, config_dir, home)):
             raise AccountError('GitHub backend configuration unavailable')
         self.executable = executable
-        # Explicit allowlist: no inherited tokens, debug, proxies, GH_HOST, repo,
-        # loaders, git tracing, or custom HTTP transports.
         self.env = {k: os.environ[k] for k in (
-            'HOME', 'PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR',
+            'PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR',
             'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
         ) if k in os.environ}
-        self.env.update(GH_CONFIG_DIR=config_dir, GH_HOST='github.com',
+        self.env.update(HOME=home, GH_CONFIG_DIR=config_dir, GH_HOST='github.com',
                         GH_PROMPT_DISABLED='1', GH_NO_UPDATE_NOTIFIER='1',
                         GH_NO_EXTENSION_UPDATE_NOTIFIER='1', GH_PAGER='cat',
                         GH_TELEMETRY='false', NO_COLOR='1')
 
-    def _run(self, args, env):
+    def _run(self, args, env, body=None):
+        # Read both pipes concurrently and kill at the byte cap, rather than
+        # allowing communicate() to collect an unbounded response in memory.
         try:
-            return subprocess.run([self.executable, *args], env=env,
-                                  stdin=subprocess.DEVNULL, capture_output=True,
-                                  text=True, timeout=45, check=False,
-                                  cwd=self.env['GH_CONFIG_DIR'])
+            proc = subprocess.Popen([self.executable, *args], env=env,
+                                    stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    cwd=self.env['GH_CONFIG_DIR'])
+            chunks = [bytearray(), bytearray()]
+            overflow = threading.Event()
+            def drain(pipe, target):
+                while True:
+                    block = pipe.read(65536)
+                    if not block:
+                        break
+                    if len(target) + len(block) > MAX_OUTPUT:
+                        overflow.set()
+                        proc.kill()
+                        break
+                    target.extend(block)
+                pipe.close()
+            workers = [threading.Thread(target=drain, args=(pipe, target), daemon=True)
+                       for pipe, target in zip((proc.stdout, proc.stderr), chunks)]
+            for worker in workers:
+                worker.start()
+            if body is not None:
+                def feed():
+                    assert proc.stdin is not None
+                    try:
+                        proc.stdin.write(json.dumps(body).encode())
+                    except (BrokenPipeError, OSError):
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
+                writer = threading.Thread(target=feed, daemon=True)
+                writer.start()
+            try:
+                proc.wait(timeout=COMMAND_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise AccountError('GitHub command timed out') from None
+            finally:
+                for worker in workers:
+                    worker.join(timeout=5)
+            if overflow.is_set():
+                raise AccountError('GitHub response too large')
+            return subprocess.CompletedProcess(args, proc.returncode,
+                chunks[0].decode('utf-8'), chunks[1].decode('utf-8'))
         except (OSError, subprocess.SubprocessError, UnicodeError):
             raise AccountError('GitHub command unavailable') from None
 
@@ -47,8 +91,7 @@ class AccountExecutor:
             rows = json.loads(result.stdout)
             if not isinstance(rows, list):
                 raise ValueError()
-            accounts = []
-            seen = set()
+            accounts, seen = [], set()
             for row in rows:
                 login = row.get('login')
                 if (row.get('state') == 'success' and isinstance(login, str)
@@ -61,58 +104,8 @@ class AccountExecutor:
         except (ValueError, AttributeError, TypeError):
             raise AccountError('GitHub accounts unavailable') from None
 
-    @staticmethod
-    def validate(args):
-        if (not isinstance(args, list) or not args or len(args) > 80
-                or any(not isinstance(a, str) or '\x00' in a for a in args)):
-            raise AccountError('Unsupported GitHub operation')
-        if args[0] == 'api':
-            tail = args[1:]
-        elif len(args) >= 2 and tuple(args[:2]) in {
-            ('repo', 'list'), ('repo', 'view'), ('pr', 'list'), ('pr', 'view'),
-            ('pr', 'checks'), ('pr', 'merge'), ('pr', 'review'),
-            ('issue', 'list'), ('issue', 'view'), ('issue', 'close'), ('issue', 'reopen'),
-        }:
-            tail = args[2:]
-        else:
-            raise AccountError('Unsupported GitHub operation')
-        values = {'--hostname', '--repo', '--json', '--jq', '--method', '-X',
-                  '--limit', '--state', '--head', '--search', '-f', '--raw-field'}
-        toggles = {'--silent', '--include', '--approve', '--merge', '--squash',
-                   '--rebase', '--delete-branch'}
-        positional = []
-        index = 0
-        while index < len(tail):
-            arg = tail[index]
-            if arg in values:
-                index += 1
-                if index == len(tail):
-                    raise AccountError('Unsupported GitHub operation')
-                value = tail[index]
-                if arg == '--hostname' and value != 'github.com':
-                    raise AccountError('Unsupported GitHub host')
-                if arg == '--repo' and not re.fullmatch(r'[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+', value):
-                    raise AccountError('Unsupported GitHub repository')
-                if arg in {'--method', '-X'} and value not in {'GET', 'POST', 'PATCH', 'PUT', 'DELETE'}:
-                    raise AccountError('Unsupported GitHub method')
-            elif arg in toggles:
-                pass
-            elif arg.startswith('-'):
-                raise AccountError('Unsupported GitHub option')
-            else:
-                positional.append(arg)
-            index += 1
-        if args[0] == 'api':
-            if len(positional) != 1 or not re.fullmatch(
-                r'(?:user|search/issues|repos/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_./?=&%,-]+)',
-                positional[0],
-            ) or '..' in positional[0] or '%' in positional[0]:
-                raise AccountError('Unsupported GitHub endpoint')
-        elif len(positional) > 1 or any(not re.fullmatch(r'[A-Za-z0-9_./-]+', p) for p in positional):
-            raise AccountError('Unsupported GitHub argument')
-
-    def execute(self, login, args):
-        self.validate(args)
+    def execute(self, login, args, body=None, dispatch=None):
+        # args is private compiler output, NEVER an HTTP request field.
         if not any(row['login'] == login for row in self.accounts()):
             raise AccountError('GitHub account unavailable')
         result = self._run(['auth', 'token', '--hostname', 'github.com', '--user', login], self.env)
@@ -120,8 +113,6 @@ class AccountExecutor:
         if result.returncode or not token or any(c.isspace() for c in token):
             raise AccountError('GitHub account unavailable')
         env = dict(self.env, GH_TOKEN=token)
-        # Resolve /user with the selected credential before any mutation. Never
-        # substitute the active account if the selected credential is stale.
         identity = self._run(['api', '--hostname', 'github.com', 'user'], env)
         try:
             verified = json.loads(identity.stdout).get('login') == login
@@ -129,10 +120,21 @@ class AccountExecutor:
             verified = False
         if identity.returncode or not verified:
             raise AccountError('GitHub account unavailable')
-        result = self._run(args, env)
-        # Error diagnostics can echo request headers; expose a fixed message.
-        # Exact-token stripping is defense in depth, not a replacement for the
-        # host's general secret redaction at the eventual HTTP boundary.
-        return {'code': result.returncode,
-                'stdout': result.stdout.replace(token, '[REDACTED]'),
-                'stderr': 'GitHub command failed' if result.returncode else ''}
+        run = lambda: self._run(args, env, body)
+        result = dispatch(run) if dispatch else run()
+        # pr checks uses nonzero exit for pending/failing checks, still with JSON.
+        if result.returncode and args[:2] != ['pr', 'checks']:
+            raise AccountError('GitHub command failed')
+        raw = result.stdout.replace(token, '[REDACTED]')
+        if result.returncode and args[:2] == ['pr', 'checks'] and not raw.strip():
+            if 'no checks reported' in result.stderr.lower():
+                return []
+            raise AccountError('GitHub command failed')
+        try:
+            return json.loads(raw) if raw.strip() else None
+        except ValueError:
+            # Mutation human-readable success output is not data and can echo
+            # credentials. It is deliberately discarded, not sent to the UI.
+            if args[:2] in (['pr', 'merge'], ['pr', 'review'], ['issue', 'close'], ['issue', 'reopen']):
+                return None
+            raise AccountError('Invalid GitHub response') from None

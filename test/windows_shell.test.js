@@ -15,7 +15,7 @@ test('shell: every gh/hermes invocation resolves the binary per platform', () =>
   assert.ok(!source.includes("const GH = 'PATH="), 'GH must not hardcode a POSIX PATH prefix')
   assert.ok(!source.includes("const HERMES = 'PATH="), 'HERMES must not hardcode a POSIX PATH prefix')
   assert.ok(source.includes('const POSIX_SHELL ='), 'platform detection is missing')
-  assert.ok(source.includes('${POSIX_SHELL ? POSIX_PATH : \'\'}gh'), 'GH must be platform-gated')
+  assert.ok(!source.includes('const GH ='), 'GitHub commands must use the private backend, not a shell prefix')
   assert.ok(source.includes('${POSIX_SHELL ? POSIX_PATH : \'\'}hermes'), 'HERMES must be platform-gated')
 })
 
@@ -24,7 +24,7 @@ test('shell: every shell.exec goes through the shellCommand wrapper', () => {
   // Windows bash hop and reintroduces the cmd.exe bug for that one query.
   const calls = source.match(/host\.request\('shell\.exec', \{ command(?:: [^}]*| )\}/g) || []
   assert.match(source, /const command = await shellCommand\(cmd\)\s+guard\(\)[^\n]*\n\s+const r = await host.request\('shell.exec', \{ command \}\)/)
-  assert.ok(calls.length >= 4, 'expected the wrapper callers, the where-git probe and the bash probe')
+  assert.ok(calls.length === 3, 'expected the wrapper callers, the where-git probe and the bash probe')
   for (const call of calls) {
     const ok =
       call.includes('shellCommand(') || call === "host.request('shell.exec', { command }" ||

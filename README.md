@@ -4,7 +4,7 @@ GitHub PRs & Issues as a right workspace pane in [Hermes Desktop](https://hermes
 
 > **Community plugin.** GitHermes is an open-source, independent project. It is **not** an official Nous Research product and is not developed or maintained by the Hermes team. It works with Hermes Desktop through its public plugin API.
 
-A single-file desktop plugin (`@hermes/plugin-sdk`) that shows your repository's open PRs and issues in a dockable pane — conversation, reviews, commits, checks, files, and in-pane merge — styled after GitHub and themed with Hermes `--ui-*` variables. No backend, no extra token: data comes from the connected `gh` CLI via `host.request('shell.exec')`.
+A desktop plugin (`@hermes/plugin-sdk`) that shows your repository's PRs and issues in a dockable pane — conversation, reviews, commits, checks, files, and in-pane merge — themed with Hermes `--ui-*` variables. A private Python backend runs each GitHub operation with the selected authenticated `gh` identity. Tokens never enter the renderer; selection never switches global CLI authentication.
 
 | PR list | PR detail |
 | --- | --- |
@@ -20,6 +20,7 @@ A single-file desktop plugin (`@hermes/plugin-sdk`) that shows your repository's
 
 ## Features
 
+- **GitHub accounts** — native selector when multiple identities are available, connection/profile-scoped saved choice, isolated caches and stale-write fencing
 - **PR list** — state pills, `+N / −N`, relative timestamps, **CI** (`passing / pending / failing`) and **review** (`approved / changes / required`) chips, exact `#N` search (`#42` does not match `#142`)
 - **Session chip + repo picker** — PR for the active session branch (same join as the core review pane); 32px pill with `https://github.com/{owner}.png` avatar
 - **PR / Issue header** — kicker, grouped meta chips, title glued to `#`, **Merge** action on open PRs (`squash / merge / rebase`, optional delete-branch, `GH_PROMPT_DISABLED=1`)
@@ -39,15 +40,17 @@ Repository / Inbox mode is shared between pane and page. Inbox is the [GitHub pu
 
 
 - Hermes Desktop
-- [`gh`](https://cli.github.com/) installed and authenticated (`gh auth status`)
+- [`gh`](https://cli.github.com/) installed and authenticated, supporting `gh auth token --user`
+- An explicit profile-scoped `GH_CONFIG_DIR` and the enabled Python backend
+- For local multi-profile Desktop, the companion [routing patch](integration/hermes-profile-routing.patch); see [account installation and verification](docs/account-execution-feasibility.md)
 
 ## Install
 
 ```bash
-hermes plugins install claudioorjunior/githermes --enable
+hermes plugins enable githermes
 ```
 
-Or manually: drop this folder into `~/.hermes/plugins/githermes/` (unified package — the desktop half lives at `desktop/plugin.js`), or copy `desktop/plugin.js` to `~/.hermes/desktop-plugins/githermes/plugin.js` (standalone disk door). The app hot-reloads on save.
+First install this checkout as a trusted unified user package in the backend's plugin directory, with both `desktop/` and `dashboard/`. The account integration is not yet published upstream. Enable it with the command above, then reload the backend to mount its Python routes. **Copying only `desktop/plugin.js` is no longer sufficient.** Follow the [installation requirements](docs/account-execution-feasibility.md#required-installation-not-performed-by-this-change), including the local-profile routing patch where required.
 
 ### Upgrading from `github-prs`
 
@@ -58,7 +61,7 @@ The plugin **id** changed (`github-prs` → `githermes`), so the old install mus
 - Disk plugins load **uncompiled**: UI is written with `jsx()`/`jsxs()` calls, no JSX syntax, no build step.
 - Only `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime` are importable.
 - Tailwind classes must already exist in the app's compiled CSS — arbitrary `var()` bracket forms (`bg-[var(--x)]`) are silently dead at runtime. Use the paren shorthand (`text-(--ui-text-tertiary)`) or scoped `<style>` blocks with real theme variables.
-- Large `gh` payloads go through `shBig` / `shJsonBig` (base64 chunks under the gateway stdout cap). Lists are capped at 30 rows by design.
+- GitHub payloads use structured JSON over authenticated plugin REST, with forced host redaction before serialization. Lists grow from 30 to a 120-row cap; comments/files use bounded pagination. No GitHub output passes through shell/base64 chunking.
 
 ## Status & contributing
 
@@ -70,4 +73,4 @@ MIT
 
 ---
 
-🇧🇷 **PT-BR:** pane de PRs e Issues no Hermes Desktop. Lista com CI/review, busca `#N` exata, header preenchido, merge no pane, timeline com threads inline (`file:line` + diff), jump-to-latest no viewport, commits em `<details>` lazy, diffs por hunk, labels com contraste W3C. Sem backend — só `gh` via `shell.exec`.
+🇧🇷 **PT-BR:** pane de PRs e Issues no Hermes Desktop. Lista com CI/review, busca `#N` exata, header preenchido, merge no pane, timeline com threads inline (`file:line` + diff), jump-to-latest no viewport, commits em `<details>` lazy, diffs por hunk, labels com contraste W3C. Backend privado com contas GitHub por operação, sem alterar a conta global do `gh`.

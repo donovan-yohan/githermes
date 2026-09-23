@@ -1,15 +1,16 @@
 /**
  * GitHermes — GitHub PRs & Issues as a right workspace pane.
- * GitHub data via `host.request('shell.exec')` + connected `gh`; Bot assignment via gateway session RPCs. No backend.
+ * GitHub data via authenticated plugin REST + private per-command gh credentials.
+ * Local git/session metadata stays on gateway RPCs; credentials never enter the renderer.
  * Session PR: cwd git branch (same join as core review) + transcript URL scan.
- * ponytail: lists page from a 30-row window up to a 120 cap; payloads route through shBig (stdout 4000 cap).
+ * Lists grow from 30 to 120 rows; structured JSON bypasses shell stdout limits.
  */
 import {
   host,
   atom,
   useValue,
-  useQuery,
-  useMutation,
+  useQuery as sdkUseQuery,
+  useMutation as sdkUseMutation,
   queryClient,
   Button,
   Input,
@@ -63,7 +64,6 @@ const TRUNK = new Set(['main', 'master', 'dev', 'develop', 'trunk'])
 // with empty stdout. Detect the shell and only prefix where it is valid.
 const POSIX_SHELL = typeof navigator === 'undefined' || !/win/i.test(navigator.platform || navigator.userAgent || '')
 const POSIX_PATH = 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH '
-const GH = `${POSIX_SHELL ? POSIX_PATH : ''}gh`
 const HERMES = `${POSIX_SHELL ? POSIX_PATH : ''}hermes`
 const PLUGIN_NAME = 'githermes'
 // $HERMES_HOME is expanded by the backend shell (profile-aware); double quotes
@@ -497,6 +497,152 @@ function resolveBash() {
   return bashReady
 }
 
+// GitHub REST transport: scoped selection is process-local; only login persists.
+export const githubAccountState = atom({ context: '', accounts: [], login: '', lease: '', epoch: 0, generation: 0, ready: false, pending: false, error: '' })
+let accountGeneration = 0
+let accountLoading = null
+const backendSelections = new Map()
+let accountSubscriptions = []
+export function bindGitHubAccountLifetime(ctx) {
+  accountSubscriptions.forEach(dispose => dispose())
+  let live = true
+  const invalidate = () => {
+    const current = githubAccountState.get(), context = githubContext()
+    accountLoading = null
+    githubAccountState.set({ ...current, context, generation: ++accountGeneration, ready: false, pending: host.state.gateway?.get?.() === 'open', error: '', ...(current.context === context ? {} : { accounts: [], login: '' }) })
+    queueMicrotask(() => { if (live && host.state.gateway?.get?.() === 'open') refreshGitHubAccounts().catch(() => {}) })
+  }
+  accountSubscriptions = [host.state.connectionId, host.state.profile, host.state.gateway].map(value => value?.listen?.(invalidate)).filter(Boolean)
+  const subscriptions = accountSubscriptions
+  ctx.onDispose?.(() => {
+    live = false
+    subscriptions.forEach(dispose => dispose())
+    accountLoading = null
+    githubAccountState.set({ ...githubAccountState.get(), generation: ++accountGeneration, ready: false, pending: false })
+  })
+}
+function githubContext() { return JSON.stringify([host.state.connectionId?.get?.() ?? '', host.state.profile?.get?.() ?? 'default']) }
+function contextError() { const error = new Error('GitHub account changed or disconnected'); error.code = 'INBOX_CONTEXT_CHANGED'; return error }
+export function captureGitHubScope() { return { ...githubAccountState.get() } }
+export function assertGitHubScope(scope) {
+  const current = githubAccountState.get()
+  if (!scope.ready || !current.ready || scope.context !== githubContext() || scope.context !== current.context || scope.generation !== current.generation || host.state.gateway?.get?.() !== 'open') throw contextError()
+}
+function accountPath(path, context) { return `${path}?profile=${encodeURIComponent(JSON.parse(context)[1])}` }
+function accountRest(path, context, options = {}) {
+  if (context !== githubContext() || host.state.gateway?.get?.() !== 'open') throw contextError()
+  if (!pluginCtx?.rest) throw new Error('GitHub backend unavailable')
+  return pluginCtx.rest(accountPath(path, context), { timeoutMs: 180_000, ...options })
+}
+export async function githubOperation(operation, scope = captureGitHubScope()) {
+  assertGitHubScope(scope)
+  const result = await accountRest('/operation', scope.context, { method: 'POST', body: { lease: scope.lease, epoch: scope.epoch, operation } })
+  assertGitHubScope(scope)
+  if (result.backend !== scope.backend) throw new Error('GitHub backend routing changed')
+  return result.data
+}
+export function scopedGitHubQueryKey(key, scope = captureGitHubScope()) {
+  return [...key, { connectionProfile: scope.context, login: scope.login, generation: scope.generation, epoch: scope.epoch, lease: scope.lease }]
+}
+function useQuery(options) {
+  const scope = useValue(githubAccountState)
+  const connection = useValue(host.state.connectionId)
+  const profile = useValue(host.state.profile)
+  const gateway = useValue(host.state.gateway)
+  const local = ['session-git', 'bots'].includes(options.queryKey?.[1])
+  useEffect(() => { if (!local && gateway === 'open') refreshGitHubAccounts().catch(() => {}) }, [connection, profile, gateway, local])
+  return sdkUseQuery({ ...options,
+    queryKey: scopedGitHubQueryKey(options.queryKey, scope),
+    enabled: (options.enabled ?? true) && (local || (scope.ready && scope.context === githubContext() && host.state.gateway?.get?.() === 'open')),
+    // Never carry previous-user placeholder rows into a new account's cache.
+    placeholderData: options.placeholderData ? (prev, query) => JSON.stringify(query?.queryKey?.at(-1)) === JSON.stringify(scopedGitHubQueryKey([], scope)[0]) ? prev : undefined : undefined,
+    queryFn: async (...args) => { if (!local) assertGitHubScope(scope); const result = await options.queryFn(...args); if (!local) assertGitHubScope(scope); return result },
+  })
+}
+function useMutation(options) {
+  const scope = useValue(githubAccountState)
+  return sdkUseMutation({ ...options, mutationFn: async (...args) => { assertGitHubScope(scope); const result = await options.mutationFn(...args); assertGitHubScope(scope); return result } })
+}
+export async function selectGitHubAccount(login, accounts = githubAccountState.get().accounts, backend = githubAccountState.get().backend) {
+  const context = githubContext(), generation = ++accountGeneration
+  githubAccountState.set({ ...githubAccountState.get(), context, accounts, login, generation, ready: false, pending: true, error: '' })
+  try {
+    const connection = JSON.parse(context)[0]
+    const previous = backendSelections.get(connection)
+    const selected = await accountRest('/selection', context, { method: 'POST', body: { login, ...(previous ? { lease: previous.lease, epoch: previous.epoch } : {}) } })
+    // Remember the new server epoch even if a concurrent context change won.
+    backendSelections.set(connection, selected)
+    if (selected.backend !== backend) throw new Error('GitHub backend routing changed')
+    if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+    pluginCtx.storage.set(`account:${context}`, login)
+    githubAccountState.set({ context, accounts, ...selected, generation, ready: true, pending: false, error: '' })
+  } catch (error) {
+    if (generation === accountGeneration) backendSelections.delete(JSON.parse(context)[0])
+    if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), ready: false, pending: false, error: error.message })
+    throw error
+  }
+}
+export async function refreshGitHubAccounts(force = false) {
+  const context = githubContext(), current = githubAccountState.get()
+  if (accountLoading?.context === context) return accountLoading.promise
+  if (!force && current.context === context && current.ready) return current
+  const generation = ++accountGeneration
+  githubAccountState.set({ ...current, context, generation, ready: false, pending: true, error: '' })
+  const promise = (async () => {
+    try {
+      const connection = JSON.parse(context)[0]
+      const previous = backendSelections.get(connection)
+      if (previous) {
+        const revoked = await accountRest('/revoke', context, { method: 'POST', body: { lease: previous.lease, epoch: previous.epoch } })
+        backendSelections.set(connection, revoked)
+      }
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      const result = await accountRest('/accounts', context)
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      const accounts = result.accounts || []
+      const saved = pluginCtx.storage.get(`account:${context}`)
+      const login = saved || accounts.find(a => a.active)?.login || accounts[0]?.login
+      if (!login || !accounts.some(a => a.login === login)) {
+        githubAccountState.set({ ...githubAccountState.get(), accounts, backend: result.backend, login: saved || '', pending: false, error: 'GitHub account unavailable' })
+        return
+      }
+      await selectGitHubAccount(login, accounts, result.backend)
+    } catch (error) {
+      if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), pending: false, error: error.message })
+      throw error
+    } finally { if (accountLoading?.generation === generation) accountLoading = null }
+  })()
+  accountLoading = { context, promise, generation }
+  return promise
+}
+export function GitHubAccountSelector() {
+  const state = useValue(githubAccountState)
+  const gateway = useValue(host.state.gateway)
+  const choose = login => {
+    if (state.context !== githubContext() || state.generation !== githubAccountState.get().generation || state.pending || gateway !== 'open') return
+    selectGitHubAccount(login).catch(() => {})
+  }
+  if (state.accounts.length < 2) {
+    const only = state.accounts[0]
+    return only && !state.ready && state.login !== only.login
+      ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: state.pending || gateway !== 'open', onClick: () => choose(only.login), children: `Use ${only.login}` })
+      : null
+  }
+  return jsxs(Select, { value: state.login, disabled: state.pending || gateway !== 'open', onValueChange: choose, children: [
+    jsx(SelectTrigger, { 'aria-label': 'GitHub account', className: 'h-7 text-xs', children: jsx(SelectValue, {}) }),
+    jsx(SelectContent, { children: state.accounts.map(a => jsx(SelectItem, { value: a.login, children: a.login }, a.login)) }),
+  ] })
+}
+export function projectGitHubData(data, projection) {
+  if (projection === 'compare') return { ahead: data.ahead_by, behind: data.behind_by }
+  if (projection === 'ahead') return data.ahead_by
+  if (projection.includes('mergeable_state')) return { ...data, user: data.user?.login ?? '', base: data.base?.ref ?? '', head: data.head?.ref ?? '', body: data.body ?? '' }
+  if (projection.includes('msg:.commit.message')) return { msg: data.commit?.message, additions: data.stats?.additions, deletions: data.stats?.deletions, files: (data.files || []).slice(0, 20).map(({ filename, status, additions, deletions }) => ({ filename, status, additions, deletions })) }
+  if (projection.includes('submitted_at')) return data.slice(0, 15).map(r => ({ ...r, user: r.user?.login ?? '', body: r.body ?? '' }))
+  if (projection.includes('full:.sha')) return data.slice(0, 30).map(c => ({ sha: c.sha.slice(0, 7), full: c.sha, msg: c.commit?.message?.split('\n')[0] ?? '', author: c.commit?.author?.name ?? c.author?.login ?? '—', date: c.commit?.author?.date ?? '' }))
+  throw new Error('Unsupported GitHub projection')
+}
+
 async function shellCommand(cmd) {
   await resolveBash()
   if (POSIX_SHELL) return cmd
@@ -514,6 +660,8 @@ async function shellCommand(cmd) {
 }
 
 async function sh(cmd, guard = () => {}) {
+  if (typeof cmd === 'object') { guard(); const value = await githubOperation(cmd); guard(); return typeof value === 'string' ? value : JSON.stringify(value) }
+  if (/\bgh\s/.test(cmd)) throw new Error('Unsupported GitHub transport')
   guard()
   const command = await shellCommand(cmd)
   guard() // No await between identity check and dispatch.
@@ -532,20 +680,7 @@ function utf8ToB64(text) {
 }
 
 async function postIssueComment(repo, number, text) {
-  const tag = `ghprs.cmt.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-  const file = `/tmp/${tag}`
-  const b64 = `/tmp/${tag}.b64`
-  try {
-    const encoded = utf8ToB64(text)
-    await sh(`: > ${sq(b64)}`)
-    for (let i = 0; i < encoded.length; i += 1800) {
-      await sh(`printf %s ${sq(encoded.slice(i, i + 1800))} >> ${sq(b64)}`)
-    }
-    await sh(`{ base64 -d < ${sq(b64)} || base64 -D < ${sq(b64)}; } > ${sq(file)}`)
-    await sh(`${GH} api ${sq(`repos/${repoApiPath(repo)}/issues/${number}/comments`)} --method POST -F ${sq(`body=@${file}`)} --silent`)
-  } finally {
-    sh(`unlink ${sq(file)}; unlink ${sq(b64)}`).catch(() => {})
-  }
+  return githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/issues/${number}/comments`, method: 'POST', body: { body: text } })
 }
 
 async function shJson(cmd, guard) {
@@ -602,18 +737,14 @@ export function repoApiPath(repo) {
   return repo.split('/').map(part => /^\.+$/.test(part) ? part.replaceAll('.', '%2E') : part).join('/')
 }
 
-// Compact GitHub REST via jq so shell.exec's 4k stdout cap doesn't truncate.
+// Structured REST with the existing view projections applied locally.
 async function ghApi(repo, path, jq) {
   if (!repoOk(repo)) throw new Error('invalid repo')
-  return shJson(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}`)} --jq ${sq(jq)}`)
+  return projectGitHubData(await githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/${path}` }), jq)
 }
 
-// shell.exec returns only the LAST 4000 chars of stdout (gateway cap), so big
-// payloads (full comment bodies) can't come back in one call. Route them through
-// a temp file read back in base64 chunks — base64 is pure ASCII, so a chunk
-// boundary can never split a multi-byte char the way raw-byte chunking would.
-// ponytail: chunk reads still cost N concurrent shell.exec calls; swap for one
-// call if the gateway cap is raised or a file-read RPC lands.
+// Legacy pure chunk helpers retained for compatibility tests. No GitHub
+// operation uses these helpers: REST returns parsed, redacted JSON directly.
 export function deriveChunkOffsets(byteLength, chunkSize = 3800) {
   if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new Error('invalid chunk byte length')
   if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) throw new Error('invalid chunk size')
@@ -646,20 +777,11 @@ export function decodeShellPayload(out) {
   return new TextDecoder('utf-8').decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
 }
 
+// Historical helper names, now accepting only structured GitHub operations.
 async function shBig(cmd, guard) {
-  const tag = `ghprs.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-  const raw = `/tmp/${tag}.raw`, b64 = `/tmp/${tag}.b64`
-  try {
-    await sh(`${cmd} > ${sq(raw)} && base64 < ${sq(raw)} > ${sq(b64)}`, guard)
-    const byteLength = Number(await sh(`wc -c < ${sq(b64)}`, guard))
-    const out = await readChunksConcurrently(
-      byteLength,
-      off => sh(`tail -c +${off} ${sq(b64)} | head -c 3800`, guard),
-    )
-    return decodeShellPayload(out)
-  } finally {
-    sh(`unlink ${sq(raw)}; unlink ${sq(b64)}`, guard).catch(() => {})
-  }
+  if (typeof cmd !== 'object') throw new Error('Unsupported GitHub transport')
+  guard?.()
+  return JSON.stringify(await githubOperation(cmd))
 }
 
 async function shJsonBig(cmd, guard) {
@@ -670,7 +792,7 @@ async function shJsonBig(cmd, guard) {
 
 async function ghApiBig(repo, path, jq) {
   if (!repoOk(repo)) throw new Error('invalid repo')
-  return shJsonBig(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}`)} --jq ${sq(jq)}`)
+  return ghApi(repo, path, jq)
 }
 
 async function ghApiBigPaginated(repo, path) {
@@ -678,10 +800,11 @@ async function ghApiBigPaginated(repo, path) {
   // gh cannot combine --slurp with --jq, so flatten the raw page array here.
   // Capped walk instead of --paginate: a giant thread would otherwise degrade
   // every poll linearly. Stops at PAGINATED_PAGE_CAP; an empty page ends it.
+  const scope = captureGitHubScope()
   const sep = path.includes('?') ? '&' : '?'
   const out = []
   for (let page = 1; page <= PAGINATED_PAGE_CAP; page++) {
-    const items = await shJsonBig(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}${sep}page=${page}`)}`)
+    const items = await githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/${path}${sep}page=${page}` }, scope)
     if (!Array.isArray(items) || !items.length) break
     out.push(...items)
   }
@@ -746,24 +869,14 @@ async function ghApiBigPaginatedProjected(repo, path, jq) {
 }
 
 async function fetchPrByNumber(repo, n) {
-  return shJsonBig(`${GH} pr view ${sq(String(n))} --repo ${sq(repo)} --json number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup`)
+  return shJsonBig({ operation: 'pr.view', repo, number: n, fields: 'number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup' })
 }
 
 async function fetchIssueByNumber(repo, n) {
-  return shJsonBig(`${GH} issue view ${sq(String(n))} --repo ${sq(repo)} --json number,title,state,author,updatedAt,url,labels`)
+  return shJsonBig({ operation: 'issue.view', repo, number: n, fields: 'number,title,state,author,updatedAt,url,labels' })
 }
 
-async function shJsonLoose(cmd) {
-  const r = await host.request('shell.exec', { command: await shellCommand(cmd) })
-  const out = (r.stdout || '').trim()
-  if (!out) {
-    if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim().slice(0, 400))
-    return null
-  }
-  try { return JSON.parse(out) } catch {
-    throw new Error('gh JSON parse failed: ' + out.slice(0, 300))
-  }
-}
+async function shJsonLoose(operation) { return githubOperation(operation) }
 
 export function prStateKey(d) {
   if (!d) return 'open'
@@ -1103,7 +1216,7 @@ function useRepos() {
   return useQuery({
     queryKey: [ID, 'repos'],
     queryFn: async () => {
-      const repos = await shJson(`${GH} repo list --limit 30 --json nameWithOwner`)
+      const repos = await shJson({ operation: 'repo.list', limit: 30, fields: 'nameWithOwner' })
       if (!Array.isArray(repos)) throw new Error('gh repo list failed')
       return repos.map(r => r.nameWithOwner).sort()
     },
@@ -1183,7 +1296,7 @@ function useSessionPr(cwd, sessionId) {
     enabled: !!repo && !!branch && !isTrunk,
     refetchInterval: MEDIUM_POLL_MS,
     queryFn: async () => {
-      const list = await shJson(`${GH} pr list --repo ${sq(repo)} --head ${sq(branch)} --limit 5 --json number,title,state,isDraft,url,headRefName,baseRefName`)
+      const list = await shJson({ operation: 'pr.list', repo, head: branch, limit: 5, fields: 'number,title,state,isDraft,url,headRefName,baseRefName' })
       return Array.isArray(list) && list.length ? { ...list[0], repo, source: 'branch' } : null
     },
     staleTime: 15_000,
@@ -1194,9 +1307,11 @@ function useSessionPr(cwd, sessionId) {
     enabled: !!sessionId && !branchQ.data && !branchQ.isFetching,
     refetchInterval: MEDIUM_POLL_MS,
     queryFn: async () => {
+      const scope = captureGitHubScope()
       const r = await host.request('session.history', { session_id: sessionId }).catch(() => null)
+      assertGitHubScope(scope)
       return resolveTranscriptPr(r?.messages, hit =>
-        shJson(`${GH} pr view ${sq(String(hit.number))} --repo ${sq(hit.repo)} --json number,title,state,isDraft,url,headRefName,baseRefName`))
+        shJson({ operation: 'pr.view', repo: hit.repo, number: hit.number, fields: 'number,title,state,isDraft,url,headRefName,baseRefName' }))
     },
     staleTime: 30_000,
   })
@@ -1298,7 +1413,9 @@ function PluginUpdateStatus() {
     refetchInterval: MEDIUM_POLL_MS,
     staleTime: 15_000,
     queryFn: async () => {
+      const scope = captureGitHubScope()
       const meta = await sh(`cat "${PLUGIN_LEDGER_PATH}"`).catch(() => '')
+      assertGitHubScope(scope)
       let entry = null
       try { entry = JSON.parse(meta)[PLUGIN_NAME] } catch { entry = null }
       const revision = typeof entry?.revision === 'string' ? entry.revision : null
@@ -1309,13 +1426,12 @@ function PluginUpdateStatus() {
         // No compare call at all when already there — the common case.
         // Braces quoted via sq(): the jq object holds a comma, which bash
         // would otherwise brace-expand.
-        const cmp = pin === revision ? null : await shJson(
-          `${GH} api repos/${PLUGIN_REPO}/compare/${sq(revision)}...${sq(pin)} --jq ${sq('{ahead: .ahead_by, behind: .behind_by}')}`).catch(() => null)
+        const cmp = pin === revision ? null : await ghApi(PLUGIN_REPO, `compare/${revision}...${pin}`, 'compare').catch(() => null)
         return { revision, ...resolvePinBehind(revision, pin, cmp), basis: 'pin' }
       }
       // A failed compare (offline, rate-limited, unresolvable revision) is
       // unknown, never "up to date" — behind: null keeps the pill neutral.
-      const ahead = await shJson(`${GH} api repos/${PLUGIN_REPO}/compare/${sq(revision)}...main --jq .ahead_by`).catch(() => null)
+      const ahead = await ghApi(PLUGIN_REPO, `compare/${revision}...main`, 'ahead').catch(() => null)
       return { revision, behind: ahead == null ? null : parseBehindCount(ahead), basis: 'main' }
     },
   })
@@ -1411,6 +1527,7 @@ function RepoLabel({ repo, size = 20 }) {
 }
 
 function RepoPicker({ repos, value, onChange }) {
+  const accountScope = useValue(githubAccountState)
   const OTHER = '__other__'
   const [manualOpen, setManualOpen] = useState(false)
   const [manual, setManual] = useState('')
@@ -1441,7 +1558,7 @@ function RepoPicker({ repos, value, onChange }) {
     const startValue = valueRef.current
     try {
       // Reachability check — format alone is not enough for "inaccessible".
-      const viewed = await shJson(`${GH} repo view ${sq(name)} --json nameWithOwner`)
+      const viewed = await githubOperation({ operation: 'repo.view', repo: name, fields: 'nameWithOwner' }, accountScope)
       // #64 review: value changed while pending (auto-follow / other surface) —
       // a stale completion must not revert the newer selection.
       if (valueRef.current !== startValue) return
@@ -1904,6 +2021,7 @@ function FilesView({ files, loading, error, onRetry }) {
 
 // Issue #2: Merge PR control (method select, delete-branch checkbox, confirm, error handling)
 function MergeControl({ repo, number, mergeableState, head, base }) {
+  const accountScope = useValue(githubAccountState)
   const [open, setOpen] = useState(false)
   const [method, setMethod] = useState('squash')
   const [deleteBranch, setDeleteBranch] = useState(false)
@@ -1938,10 +2056,8 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
     try {
       const flag = method === 'squash' ? '--squash' : method === 'rebase' ? '--rebase' : '--merge'
       const del = deleteBranch ? ' --delete-branch' : ''
-      // gh pr merge prompts interactively (branch protection, merge queue);
-      // shell.exec has no TTY so it would hang. gh has no --yes on this
-      // subcommand; GH_PROMPT_DISABLED=1 suppresses prompts for this call only.
-      await sh(`GH_PROMPT_DISABLED=1 ${GH} pr merge ${sq(String(number))} --repo ${sq(repo)} ${flag}${del}`)
+      // The private backend disables interactive prompts in its child env.
+      await githubOperation({ operation: 'pr.merge', repo, number, strategy: flag.slice(2), deleteBranch: Boolean(del) }, accountScope)
       queryClient.invalidateQueries({ queryKey: [ID, 'pr-page', repo, String(number)] })
       queryClient.invalidateQueries({ queryKey: [ID, 'pr-checks', repo, String(number)] })
       queryClient.invalidateQueries({ queryKey: [ID, 'prs', repo] })
@@ -2049,6 +2165,7 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
 // Issue #58: approve an open PR from the detail toolbar. Rendered by PrDetail
 // only when canApprove() gates it in — no viewer fetch of its own.
 function ApproveControl({ repo, number }) {
+  const accountScope = useValue(githubAccountState)
   const n = String(number)
   const [open, setOpen] = useState(false)
   const [isApproving, setIsApproving] = useState(false)
@@ -2058,7 +2175,7 @@ function ApproveControl({ repo, number }) {
     setIsApproving(true)
     setError(null)
     try {
-      await sh(`${GH} pr review ${sq(n)} --repo ${sq(repo)} --approve`)
+      await githubOperation({ operation: 'pr.review', repo, number: n }, accountScope)
       const plan = approvePlan(repo, n)
       await Promise.all(plan.invalidate.map(queryKey => queryClient.invalidateQueries({ queryKey })))
       setOpen(false)
@@ -2133,6 +2250,7 @@ function ApproveControl({ repo, number }) {
 // for both verbs — reopen used to land on the confirm panel immediately, which
 // made Cancel a no-op (confirming stayed false, panel stayed open).
 function IssueControl({ repo, number, state }) {
+  const accountScope = useValue(githubAccountState)
   const n = String(number)
   const action = issueAction(state)
   const [confirming, setConfirming] = useState(false)
@@ -2145,7 +2263,7 @@ function IssueControl({ repo, number, state }) {
     setIsPending(true)
     setError(null)
     try {
-      await sh(`${GH} issue ${action} ${sq(n)} --repo ${sq(repo)}`)
+      await githubOperation({ operation: `issue.${action}`, repo, number: n }, accountScope)
       const plan = issuePlan(repo, n, state)
       await Promise.all(plan.invalidate.map(queryKey => queryClient.invalidateQueries({ queryKey })))
       setConfirming(false)
@@ -2642,7 +2760,7 @@ function PrList({ repo, onOpen, query, active = true }) {
     placeholderData: (prev) => prev,
     // Issue #10: expanded list metadata can overflow the stdout cap, so the
     // list routes through shBig.
-    queryFn: () => shJsonBig(`${GH} pr list --repo ${sq(repo)} --state ${sq(state)} --limit ${limit} --json number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,labels`),
+    queryFn: () => shJsonBig({ operation: 'pr.list', repo, state, limit, fields: 'number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,labels' }),
     staleTime: 15_000,
     refetchInterval: MEDIUM_POLL_MS,
     refetchOnWindowFocus: true,
@@ -2727,7 +2845,7 @@ function IssueList({ repo, onOpen, query, active = true }) {
     // Same key-growth hold as the PR list above.
     placeholderData: (prev) => prev,
     // Issue #10: same stdout-cap routing as the PR list (busy repos overflow).
-    queryFn: () => shJsonBig(`${GH} issue list --repo ${sq(repo)} --state ${sq(state)} --limit ${limit} --json number,title,state,author,updatedAt,url,labels`),
+    queryFn: () => shJsonBig({ operation: 'issue.list', repo, state, limit, fields: 'number,title,state,author,updatedAt,url,labels' }),
     staleTime: 15_000,
     refetchInterval: MEDIUM_POLL_MS,
     refetchOnWindowFocus: true,
@@ -2972,7 +3090,7 @@ function CommentComposer({ repo, number, kind, onPosted }) {
   const inflight = useRef(false)
   const me = useQuery({
     queryKey: [ID, 'user'],
-    queryFn: async () => loginOf(await sh(`${GH} api user --jq .login`)),
+    queryFn: async () => loginOf((await githubOperation({ operation: 'github.api', path: 'user' })).login),
     staleTime: 3_600_000,
   })
   const mutation = useMutation({
@@ -3117,7 +3235,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
     enabled: !!repo && !!number && active && (page === 'checks' || page === 'conversation'),
     queryFn: async () => {
       try {
-        const rows = await shJsonLoose(`${GH} pr checks ${sq(n)} --repo ${sq(repo)} --json name,state,bucket,link`)
+        const rows = await shJsonLoose({ operation: 'pr.checks', repo, number: n, fields: 'name,state,bucket,link' })
         return Array.isArray(rows) ? rows : []
       } catch (e) {
         // `gh pr checks` exits 1 with "no checks reported…" when the PR has no CI (#23):
@@ -3134,7 +3252,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
   // Same [ID,'user'] cache entry as CommentComposer — one fetch total.
   const userQ = useQuery({
     queryKey: [ID, 'user'],
-    queryFn: async () => loginOf(await sh(`${GH} api user --jq .login`)),
+    queryFn: async () => loginOf((await githubOperation({ operation: 'github.api', path: 'user' })).login),
     staleTime: 3_600_000,
   })
 
@@ -3286,7 +3404,7 @@ function IssueDetail({ repo, number, onBack, active = true }) {
   const q = useQuery({
     queryKey: [ID, 'issue-detail', repo, n],
     enabled: !!repo && !!number && active,
-    queryFn: () => shJsonBig(`${GH} issue view ${sq(n)} --repo ${sq(repo)} --json number,title,body,state,author,createdAt,comments,labels,url`),
+    queryFn: () => shJsonBig({ operation: 'issue.view', repo, number: n, fields: 'number,title,body,state,author,createdAt,comments,labels,url' }),
     staleTime: 5_000,
     refetchInterval: query => livePollInterval(query.state.data),
     refetchOnWindowFocus: true,
@@ -3672,8 +3790,7 @@ export const INBOX_GRAPHQL = `query GitHermesInbox($search: String!, $cursor: St
 export async function readInboxRequest(request, guard) {
   if (request.kind !== 'graphql' || request.query !== INBOX_GRAPHQL) throw new Error('Unsupported PR request')
   guard?.()
-  const command = `${GH} api --hostname github.com graphql -f ${sq(`query=${request.query}`)} -f ${sq(`search=${request.variables.search}`)}${request.variables.cursor ? ` -f ${sq(`cursor=${request.variables.cursor}`)}` : ''}`
-  const result = await shJsonBig(command, guard)
+  const result = await githubOperation({ operation: 'github.api', path: 'graphql', method: 'POST', body: { query: request.query, variables: request.variables } })
   guard?.()
   return result
 }
@@ -3715,7 +3832,7 @@ export async function loadGitHubInbox(input, read = readInboxRequest, now = new 
   return { kind: 'pulls', items: rows, partial, statuses: [...statuses] }
 }
 export function inboxIdentity(api = host) {
-  return JSON.stringify([api.state.connectionId.get(), api.state.profile.get()])
+  return JSON.stringify([api.state.connectionId.get(), api.state.profile.get(), githubAccountState.get().login, githubAccountState.get().generation])
 }
 export function assertInboxContext(identity, api = host) {
   if (api.state.gateway.get() !== 'open' || inboxIdentity(api) !== identity) {
@@ -3745,7 +3862,8 @@ export function GitHubInbox({ active = true, read = readInboxRequest } = {}) {
   const [filters, setFilters] = useState(() => inboxFilters())
   const [repos, setRepos] = useState(''), [org, setOrg] = useState('')
   const [filterError, setFilterError] = useState('')
-  const identity = JSON.stringify([connectionId, profile])
+  const account = useValue(githubAccountState)
+  const identity = JSON.stringify([connectionId, profile, account.login, account.generation])
   const query = useQuery(inboxQueryOptions(filters, identity, active, gateway, read))
   const change = patch => setFilters(old => inboxFilters({ ...old, ...patch }))
   const rows = query.data?.items || []
@@ -3803,13 +3921,20 @@ export function GitHubSurface({ page = false } = {}) {
   const visible = useValue(typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID) : $alwaysVisible)
   const connection = useValue(host.state.connectionId)
   const profile = useValue(host.state.profile)
+  const gateway = useValue(host.state.gateway)
+  const account = useValue(githubAccountState)
+  useEffect(() => { if (gateway === 'open') refreshGitHubAccounts().catch(() => {}) }, [connection, profile, gateway])
+  const ready = account.ready && account.context === githubContext() && gateway === 'open'
   return jsxs('div', { className: 'flex h-full min-h-0 flex-col', children: [
-    jsx('div', { className: 'shrink-0 p-2 border-b border-(--ui-stroke-tertiary)', children: jsx(SegmentedControl, {
-      value: mode, onChange: setGitHubMode, options: [{ id: 'repository', label: 'Repository' }, { id: 'inbox', label: 'Inbox' }],
-    }) }),
-    jsx('div', { className: 'flex-1 min-h-0', children: mode === 'inbox'
-      ? jsx(GitHubInbox, { active: page || visible }, JSON.stringify([connection, profile]))
-      : jsx(page ? RepositoryPage : RepositoryPane, {}) }),
+    jsxs('div', { className: 'flex flex-wrap gap-2 shrink-0 p-2 border-b border-(--ui-stroke-tertiary)', children: [
+      jsx(SegmentedControl, { value: mode, onChange: setGitHubMode, options: [{ id: 'repository', label: 'Repository' }, { id: 'inbox', label: 'Inbox' }] }),
+      jsx(GitHubAccountSelector, {}),
+      jsx(Button, { variant: 'ghost', size: 'xs', disabled: account.pending || gateway !== 'open', onClick: () => refreshGitHubAccounts(true).catch(() => {}), children: 'Refresh accounts' }),
+    ] }),
+    ready ? jsx('div', { className: 'flex-1 min-h-0', children: mode === 'inbox'
+      ? jsx(GitHubInbox, { active: page || visible })
+      : jsx(page ? RepositoryPage : RepositoryPane, {}) }, JSON.stringify([connection, profile, account.login, account.generation]))
+      : jsx('div', { role: account.error ? 'alert' : 'status', className: 'p-3 text-xs', children: gateway !== 'open' ? 'Disconnected' : account.error || 'Loading accounts…' }),
   ] })
 }
 function GitHubPane() { return jsx(GitHubSurface, {}) }
@@ -3820,6 +3945,7 @@ export default {
   name: 'GitHermes',
   register(ctx) {
     pluginCtx = ctx
+    bindGitHubAccountLifetime(ctx)
     // Start the shared probe; shellCommand awaits it before any command runs.
     resolveBash()
     githubShellStore.mode.set(ctx.storage.get('mode') === 'inbox' ? 'inbox' : 'repository')

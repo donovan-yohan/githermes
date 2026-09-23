@@ -73,6 +73,7 @@ test('repository picker composes PopoverTrigger with an SDK Button', () => {
   const code = section('function RepoPicker(', 'export function labelTextColor(')
   const node = evaluate(code, "RepoPicker({ repos: ['owner/repo'], value: 'owner/repo', onChange() {} })", {
     useState: value => [value, () => {}], useRef: value => ({ current: value }), useEffect() {},
+    useValue: value => value.get(), githubAccountState: { get: () => ({ ready: true, generation: 1 }) },
     repoOk: () => false, RepoLabel: Symbol('RepoLabel'),
   })
   const trigger = node.props.children[0].props.children[0]

@@ -1,0 +1,11 @@
+--- a/apps/desktop/electron/connection-config.ts
++++ b/apps/desktop/electron/connection-config.ts
+@@ -584,2 +584,8 @@
+ const LOCAL_PRIMARY_SCOPED_ROUTES = new Set([
++  // GitHermes binds every route to _config_profile_scope(profile). Keep
++  // metadata, selection leases, and commands in the same host process.
++  'GET /api/plugins/githermes/accounts',
++  'POST /api/plugins/githermes/selection',
++  'POST /api/plugins/githermes/revoke',
++  'POST /api/plugins/githermes/operation',
+   'GET /api/config',
