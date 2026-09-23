@@ -255,3 +255,32 @@ def test_output_limit_and_fixed_child_error(fake):
     gh.write_text('#!/usr/bin/python3\nprint("x" * (5*1024*1024))\n')
     with pytest.raises(backend.AccountError, match='too large'):
         backend.AccountExecutor(str(gh), str(config)).accounts()
+
+
+@pytest.mark.parametrize('mode', ['duplex', 'stderr-overflow', 'closed-pipes', 'bad-utf8', 'missing'])
+def test_supervisor_io_cleanup_and_safe_errors(fake, mode):
+    gh, config = fake
+    backend = module('account_backend')
+    backend.COMMAND_TIMEOUT = .5
+    scripts = {
+        'duplex': "import os, sys\nos.write(1, b'x'*200000)\nos.write(2, b'y'*200000)\nassert len(sys.stdin.buffer.read()) > 200000\n",
+        'stderr-overflow': "import os\nos.write(2, b'x'*(5*1024*1024))\n",
+        'closed-pipes': "import os, time\nos.close(1); os.close(2)\ntime.sleep(10)\n",
+        'bad-utf8': "import os\nos.write(1, b'\\xff')\n",
+        'missing': '',
+    }
+    gh.write_text('#!/usr/bin/python3\n' + scripts[mode])
+    if mode == 'missing': gh.unlink()
+    executor = backend.AccountExecutor(str(gh), str(config))
+    # Linux fd census also catches leaked parent pipe ends across repeated calls.
+    fd_dir = Path('/proc/self/fd')
+    before = len(list(fd_dir.iterdir())) if fd_dir.exists() else None
+    for _ in range(3):
+        if mode == 'duplex':
+            result = executor._run(['private-operation'], executor.env, {'body': 'z'*300000})
+            assert result.stdout == 'x'*200000 and result.stderr == 'y'*200000
+        else:
+            message = {'stderr-overflow': 'too large', 'closed-pipes': 'timed out'}.get(mode, 'unavailable')
+            with pytest.raises(backend.AccountError, match=message):
+                executor._run(['private-operation'], executor.env)
+    if before is not None: assert len(list(fd_dir.iterdir())) == before

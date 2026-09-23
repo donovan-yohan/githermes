@@ -3,7 +3,8 @@ import json
 import os
 import re
 import subprocess
-import threading
+import sys
+from pathlib import Path
 
 MAX_OUTPUT = 4 * 1024 * 1024
 COMMAND_TIMEOUT = 45
@@ -30,59 +31,27 @@ class AccountExecutor:
                         GH_TELEMETRY='false', NO_COLOR='1')
 
     def _run(self, args, env, body=None):
-        # Read both pipes concurrently and kill at the byte cap, rather than
-        # allowing communicate() to collect an unbounded response in memory.
+        # A fresh, session-independent interpreter owns the deadline and fence.
+        # Credentials/body travel only through a private pipe, never argv/files.
+        request = dict(executable=self.executable, args=args, env=env, body=body,
+                       timeout=COMMAND_TIMEOUT, limit=MAX_OUTPUT, fence=self.fence_fd)
         try:
-            proc = subprocess.Popen([self.executable, *args], env=env,
-                                    stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    cwd=self.env['GH_CONFIG_DIR'],
-                                    pass_fds=() if self.fence_fd is None else (self.fence_fd,))
-            chunks = [bytearray(), bytearray()]
-            overflow = threading.Event()
-            def drain(pipe, target):
-                while True:
-                    block = pipe.read(65536)
-                    if not block:
-                        break
-                    if len(target) + len(block) > MAX_OUTPUT:
-                        overflow.set()
-                        proc.kill()
-                        break
-                    target.extend(block)
-                pipe.close()
-            workers = [threading.Thread(target=drain, args=(pipe, target), daemon=True)
-                       for pipe, target in zip((proc.stdout, proc.stderr), chunks)]
-            for worker in workers:
-                worker.start()
-            if body is not None:
-                def feed():
-                    assert proc.stdin is not None
-                    try:
-                        proc.stdin.write(json.dumps(body).encode())
-                    except (BrokenPipeError, OSError):
-                        pass
-                    finally:
-                        try:
-                            proc.stdin.close()
-                        except (BrokenPipeError, OSError):
-                            pass
-                writer = threading.Thread(target=feed, daemon=True)
-                writer.start()
-            try:
-                proc.wait(timeout=COMMAND_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                raise AccountError('GitHub command timed out') from None
-            finally:
-                for worker in workers:
-                    worker.join(timeout=5)
-            if overflow.is_set():
-                raise AccountError('GitHub response too large')
-            return subprocess.CompletedProcess(args, proc.returncode,
-                chunks[0].decode('utf-8'), chunks[1].decode('utf-8'))
-        except (OSError, subprocess.SubprocessError, UnicodeError):
+            with subprocess.Popen(
+                    [sys.executable, '-I', str(Path(__file__).with_name('command_supervisor.py'))],
+                    env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, start_new_session=True,
+                    pass_fds=() if self.fence_fd is None else (self.fence_fd,)) as proc:
+                output, _ = proc.communicate(json.dumps(request).encode())
+            if proc.returncode:
+                raise AccountError('GitHub command unavailable')
+            result = json.loads(output)
+            if result.get('error'):
+                messages = {'timeout': 'GitHub command timed out',
+                            'overflow': 'GitHub response too large'}
+                raise AccountError(messages.get(result['error'], 'GitHub command unavailable'))
+            return subprocess.CompletedProcess(args, result['code'],
+                                               result['stdout'], result['stderr'])
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, KeyError):
             raise AccountError('GitHub command unavailable') from None
 
     def accounts(self):

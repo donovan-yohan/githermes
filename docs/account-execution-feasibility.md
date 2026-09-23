@@ -36,12 +36,23 @@ Local git and Hermes session operations remain separate from GitHub REST.
   correctness/throughput tradeoff. Lock waits are bounded to 55 seconds and
   each `gh` subprocess to 45 seconds. A busy response is uncertainty, not an
   authoritative revocation. An already-dispatched mutation is not canceled.
-- The `gh` subprocess inherits the lock descriptor. The backend closes its fd
-  rather than explicitly unlocking it. If the backend crashes, the inherited
-  descriptor retains the fence until `gh` exits; a concurrent switch cannot
-  overtake that child. If a crashed backend leaves a hung child, other requests
-  time out closed until the child exits/is terminated. There is no mutation
-  replay or exactly-once guarantee: after a lost reply, inspect remote state.
+- A fresh, detached Python supervisor and `gh` both inherit the lock descriptor.
+  All owners close their fd rather than explicitly unlocking it. Even after
+  backend SIGKILL, the supervisor enforces the original 45-second command
+  deadline, kills the child process group on timeout/overflow, and reaps `gh`
+  before exiting. A concurrent switch cannot overtake that child. It uses
+  nonblocking multiplexed stdin/stdout/stderr, caps each output stream at 4 MiB,
+  and passes credentials/body over a private pipe (never supervisor argv/files
+  or logs). The `gh` environment remains the existing allowlist plus its private
+  account token; the supervisor's environment contains no token.
+- This protects against backend death, not killing/stopping the supervisor itself
+  or an entire service cgroup. POSIX SIGKILL cannot bound uninterruptible kernel
+  sleep; in that case the supervisor waits to reap and keeps the fence closed.
+  Trusted `gh` must not leave background descendants retaining the lock descriptor
+  after it exits, or daemonize them out of its process group. An orphan supervisor's own final reaping is the
+  responsibility of the OS init/subreaper. No daemon or heavy dependency is added.
+  There is no mutation replay or exactly-once guarantee: after a lost reply,
+  inspect remote state.
 
 The store is shared at the **gateway root**, not a selected profile or plugin
 installation directory. All participating processes must share that root,

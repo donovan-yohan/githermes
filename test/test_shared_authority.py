@@ -189,6 +189,53 @@ def test_dispatch_fence_survives_backend_crash_until_child_exit(mounted, fake):
     assert (config / 'calls.jsonl').exists()
 
 
+def test_orphan_deadline_reaps_child_and_releases_same_fence(mounted, fake, monkeypatch):
+    client, headers, api, profiles = mounted
+    gh, _ = fake
+    gh.write_text(FAKE_GH.replace("    else:\n        with open", "    else:\n        import time\n        from pathlib import Path\n        root = Path(os.environ['GH_CONFIG_DIR'])\n        (root / 'child-pid').write_text(str(os.getpid()))\n        while True: time.sleep(.01)\n        with open"))
+    selected = call(client, headers, 'selection', body={'login': 'alpha'}).json()
+    monkeypatch.setattr(api.backend, 'COMMAND_TIMEOUT', 2)
+    payload = {k: selected[k] for k in ('lease', 'epoch')} | {'operation': {'operation': 'issue.close', 'repo': 'a/b', 'number': 1}}
+    worker = multiprocessing.get_context('fork').Process(target=api.work, args=('alpha', payload, 'execute'))
+    config = profiles['alpha'][1]
+    fence = profiles['alpha'][0].parent.parent / 'githermes-authority' / 'fence.lock'
+    inode = fence.stat().st_ino
+    child = None
+    worker.start()
+    try:
+        for _ in range(500):
+            if (config / 'child-pid').exists(): break
+            time.sleep(.01)
+        else: pytest.fail('dispatch not reached')
+        child = int((config / 'child-pid').read_text())
+        worker.kill(); worker.join(5)
+        import fcntl
+        with fence.open() as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    assert time.monotonic() < deadline, 'orphan retained fence past autonomous deadline'
+                    time.sleep(.02)
+            # Reaped, not merely a zombie that no longer holds descriptors.
+            with pytest.raises(ProcessLookupError): os.kill(child, 0)
+        assert fence.stat().st_ino == inode
+        revoked = call(client, headers, 'revoke', body={k: selected[k] for k in ('lease', 'epoch')})
+        assert revoked.status_code == 200
+        assert operation(client, headers, selected).status_code == 409
+        assert not (config / 'calls.jsonl').exists()
+    finally:
+        if worker.is_alive(): worker.kill()
+        worker.join(5)
+        if child is not None:
+            try: os.kill(child, 9)
+            except ProcessLookupError: pass
+
+
 def test_private_store_permissions_and_bounded_cleanup(mounted):
     client, headers, api, profiles = mounted
     selected = call(client, headers, 'selection', body={'login': 'alpha'}).json()
