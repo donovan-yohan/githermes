@@ -2731,11 +2731,7 @@ function ListEmptyState({ kind, state, repo, query }) {
   const noun = isPr ? 'pull requests' : 'issues'
   const title = query ? 'No matching results' : state === 'all' ? `No ${noun} found` : `No ${state} ${noun}`
   return jsxs('div', { className: 'flex h-full flex-col items-center justify-center p-4 text-center', children: [
-    jsx(EmptyState, { title, description: query
-      ? `Nothing matches “${query}”. Try a title, number, author, branch, or label.`
-      : state === 'all'
-      ? `Nothing to show in ${repo}.`
-      : `There are no ${state} ${noun} in this repository.` }),
+    jsx(EmptyState, { title }),
     jsxs('div', { className: 'mt-4 flex flex-wrap justify-center gap-2', children: [
       query ? jsx(Button, {
         variant: 'outline',
@@ -3906,7 +3902,7 @@ export function GitHubInbox({ active = true, read = readInboxRequest } = {}) {
       jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: `${item.repo || item.repository?.nameWithOwner} #${item.number} · ${item.isDraft ? 'Draft' : item.reviewDecision === 'CHANGES_REQUESTED' ? 'Changes requested' : item.mergeStateStatus || 'Status unknown'}` }),
       jsxs('div', { className: 'flex flex-wrap items-center gap-1', children: [
         jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url, onClick: () => openExternal(url), children: 'Open GitHub' }),
-        url ? jsx(CopyButton, { text: url, label: 'Copy GitHub link', appearance: 'icon', buttonSize: 'icon-sm' }) : null,
+        url ? jsx(CopyButton, { text: url, label: 'Copy link', appearance: 'button', buttonSize: 'xs' }) : null,
         jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item)) }, children: 'Ask Hermes · draft' }),
       ] }),
     ] }, item.id)
