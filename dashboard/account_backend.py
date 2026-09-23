@@ -19,6 +19,7 @@ class AccountExecutor:
         if not all(os.path.isabs(p) for p in (executable, config_dir, home)):
             raise AccountError('GitHub backend configuration unavailable')
         self.executable = executable
+        self.fence_fd = None
         self.env = {k: os.environ[k] for k in (
             'PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR',
             'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
@@ -35,7 +36,8 @@ class AccountExecutor:
             proc = subprocess.Popen([self.executable, *args], env=env,
                                     stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    cwd=self.env['GH_CONFIG_DIR'])
+                                    cwd=self.env['GH_CONFIG_DIR'],
+                                    pass_fds=() if self.fence_fd is None else (self.fence_fd,))
             chunks = [bytearray(), bytearray()]
             overflow = threading.Event()
             def drain(pipe, target):

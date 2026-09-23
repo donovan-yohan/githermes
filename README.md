@@ -42,7 +42,7 @@ Repository / Inbox mode is shared between pane and page. Inbox is the [GitHub pu
 - Hermes Desktop
 - [`gh`](https://cli.github.com/) installed and authenticated, supporting `gh auth token --user`
 - An explicit profile-scoped `GH_CONFIG_DIR` and the enabled Python backend
-- For local multi-profile Desktop, the companion [routing patch](integration/hermes-profile-routing.patch); see [account installation and verification](docs/account-execution-feasibility.md)
+- A POSIX gateway backend with a shared local gateway-root authority store; no account-routing host patch is required. See [account installation and verification](docs/account-execution-feasibility.md).
 
 ## Install
 
@@ -50,7 +50,7 @@ Repository / Inbox mode is shared between pane and page. Inbox is the [GitHub pu
 hermes plugins enable githermes
 ```
 
-First install this checkout as a trusted unified user package in the backend's plugin directory, with both `desktop/` and `dashboard/`. The account integration is not yet published upstream. Enable it with the command above, then reload the backend to mount its Python routes. **Copying only `desktop/plugin.js` is no longer sufficient.** Follow the [installation requirements](docs/account-execution-feasibility.md#required-installation-not-performed-by-this-change), including the local-profile routing patch where required.
+First install this checkout as a trusted unified user package in the backend's plugin directory, with both `desktop/` and `dashboard/`. The account integration is not yet published upstream. Enable it with the command above, then reload the backend to mount its Python routes. **Copying only `desktop/plugin.js` is no longer sufficient.** Follow the [installation requirements](docs/account-execution-feasibility.md#installation-requirements-not-performed-by-this-change); account switching requires no plugin-specific host routing patch.
 
 ### Upgrading from `github-prs`
 

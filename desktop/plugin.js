@@ -497,7 +497,7 @@ function resolveBash() {
   return bashReady
 }
 
-// GitHub REST transport: scoped selection is process-local; only login persists.
+// GitHub REST transport: durable server leases; only login persists in UI storage.
 export const githubAccountState = atom({ context: '', accounts: [], login: '', lease: '', epoch: 0, generation: 0, ready: false, pending: false, error: '' })
 let accountGeneration = 0
 let accountLoading = null
@@ -563,21 +563,57 @@ function useMutation(options) {
   const scope = useValue(githubAccountState)
   return sdkUseMutation({ ...options, mutationFn: async (...args) => { assertGitHubScope(scope); const result = await options.mutationFn(...args); assertGitHubScope(scope); return result } })
 }
+// One queue per remote connection, not per profile: GET and POST can land in
+// different backend processes, but share a durable authority on that gateway.
+const accountQueues = new Map()
+function serializeAccount(context, run) {
+  const connection = JSON.parse(context)[0]
+  const previous = accountQueues.get(connection) || Promise.resolve()
+  const next = previous.catch(() => {}).then(run)
+  accountQueues.set(connection, next)
+  next.finally(() => { if (accountQueues.get(connection) === next) accountQueues.delete(connection) }).catch(() => {})
+  return next
+}
+function clientSelection(connection) {
+  if (!backendSelections.has(connection)) {
+    // Capability exists BEFORE the first request. A lost response can always be
+    // revoked without creating a second, orphaned client authority.
+    const bytes = crypto.getRandomValues(new Uint8Array(32))
+    const lease = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+    backendSelections.set(connection, { lease, epoch: 0 })
+  }
+  return backendSelections.get(connection)
+}
+async function revokeSelection(context) {
+  const connection = JSON.parse(context)[0], previous = backendSelections.get(connection)
+  if (!previous) return
+  const revoked = await accountRest('/revoke', context, { method: 'POST', body: { lease: previous.lease, epoch: previous.epoch } })
+  // Unknown/expired is an authoritative successful revoke (with a tombstone).
+  // Transport errors are NOT proof of revocation: retain the capability.
+  backendSelections.set(connection, revoked)
+}
+async function selectAccountInside(login, accounts, backend, context, generation) {
+  if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+  const connection = JSON.parse(context)[0], previous = clientSelection(connection)
+  const selected = await accountRest('/selection', context, { method: 'POST', body: { login, lease: previous.lease, epoch: previous.epoch } })
+  backendSelections.set(connection, selected)
+  if (generation !== accountGeneration || context !== githubContext()) {
+    // Same connection, new profile: clean up before letting its queued request
+    // select. A different connection cannot be addressed through this SDK;
+    // retain the capability and revoke on return (otherwise server TTL expires).
+    if (connection === JSON.parse(githubContext())[0] && host.state.gateway?.get?.() === 'open') await revokeSelection(githubContext())
+    throw contextError()
+  }
+  if (selected.backend !== backend) throw new Error('GitHub backend routing changed')
+  pluginCtx.storage.set(`account:${context}`, login)
+  githubAccountState.set({ context, accounts, ...selected, generation, ready: true, pending: false, error: '' })
+}
 export async function selectGitHubAccount(login, accounts = githubAccountState.get().accounts, backend = githubAccountState.get().backend) {
   const context = githubContext(), generation = ++accountGeneration
   githubAccountState.set({ ...githubAccountState.get(), context, accounts, login, generation, ready: false, pending: true, error: '' })
   try {
-    const connection = JSON.parse(context)[0]
-    const previous = backendSelections.get(connection)
-    const selected = await accountRest('/selection', context, { method: 'POST', body: { login, ...(previous ? { lease: previous.lease, epoch: previous.epoch } : {}) } })
-    // Remember the new server epoch even if a concurrent context change won.
-    backendSelections.set(connection, selected)
-    if (selected.backend !== backend) throw new Error('GitHub backend routing changed')
-    if (generation !== accountGeneration || context !== githubContext()) throw contextError()
-    pluginCtx.storage.set(`account:${context}`, login)
-    githubAccountState.set({ context, accounts, ...selected, generation, ready: true, pending: false, error: '' })
+    await serializeAccount(context, () => selectAccountInside(login, accounts, backend, context, generation))
   } catch (error) {
-    if (generation === accountGeneration) backendSelections.delete(JSON.parse(context)[0])
     if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), ready: false, pending: false, error: error.message })
     throw error
   }
@@ -588,14 +624,10 @@ export async function refreshGitHubAccounts(force = false) {
   if (!force && current.context === context && current.ready) return current
   const generation = ++accountGeneration
   githubAccountState.set({ ...current, context, generation, ready: false, pending: true, error: '' })
-  const promise = (async () => {
+  const promise = serializeAccount(context, async () => {
     try {
-      const connection = JSON.parse(context)[0]
-      const previous = backendSelections.get(connection)
-      if (previous) {
-        const revoked = await accountRest('/revoke', context, { method: 'POST', body: { lease: previous.lease, epoch: previous.epoch } })
-        backendSelections.set(connection, revoked)
-      }
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      await revokeSelection(context)
       if (generation !== accountGeneration || context !== githubContext()) throw contextError()
       const result = await accountRest('/accounts', context)
       if (generation !== accountGeneration || context !== githubContext()) throw contextError()
@@ -606,12 +638,12 @@ export async function refreshGitHubAccounts(force = false) {
         githubAccountState.set({ ...githubAccountState.get(), accounts, backend: result.backend, login: saved || '', pending: false, error: 'GitHub account unavailable' })
         return
       }
-      await selectGitHubAccount(login, accounts, result.backend)
+      await selectAccountInside(login, accounts, result.backend, context, generation)
     } catch (error) {
       if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), pending: false, error: error.message })
       throw error
     } finally { if (accountLoading?.generation === generation) accountLoading = null }
-  })()
+  })
   accountLoading = { context, promise, generation }
   return promise
 }
