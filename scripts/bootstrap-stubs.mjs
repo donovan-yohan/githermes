@@ -21,14 +21,15 @@ const files = {
     main: './index.js',
   },
   'node_modules/@hermes/plugin-sdk/index.js': `export const host = { state: { activeSessionId: {} }, request: async () => ({ code: 0, stdout: '' }) }
-export const atom = (init) => ({ get: () => init, set: () => {} })
-export const useValue = () => null
-export const useQuery = () => ({ isLoading: false, isError: false, data: null })
+export const atom = (init) => { const listeners = new Set(); return { get: () => init, set: value => { if (value === init) return; init = value; listeners.forEach(fn => fn(value)) }, listen: fn => { listeners.add(fn); return () => listeners.delete(fn) } } }
+export const useValue = value => value?.get?.() ?? null
+export const useQuery = options => globalThis.__ghTestQuery?.(options) ?? ({ isLoading: false, isError: false, data: null })
 export const useMutation = () => ({ mutate: () => {}, isPending: false, error: null })
 export const queryClient = { invalidateQueries: () => Promise.resolve() }
 export const Button = () => null
 export const Input = () => null
 export const Textarea = () => null
+export const Checkbox = () => null
 export const Badge = () => null
 export const CopyButton = () => null
 export const StatusDot = () => null
@@ -72,7 +73,7 @@ export const Tip = () => null
       './jsx-runtime': './jsx-runtime.js',
     },
   },
-  'node_modules/react/index.js': `export const useState = (init) => [init, () => {}]
+  'node_modules/react/index.js': `export const useState = (init) => [typeof init === 'function' ? init() : init, () => {}]
 export const useEffect = () => {}
 export const useMemo = (fn) => fn()
 export const useRef = (init) => ({ current: init })

@@ -30,8 +30,8 @@ test('Paginated REST walks are capped and newest-first for comments', () => {
 })
 
 test('Issue #34: polling is tiered, focus-aware and paused with the pane', () => {
-  assert.equal((source.match(/refetchIntervalInBackground/g) || []).length, 0)
-  assert.equal((source.match(/refetchOnWindowFocus: true/g) || []).length, 8)
+  assert.equal((source.match(/refetchIntervalInBackground:\s*true/g) || []).length, 0)
+  assert.equal((source.match(/refetchOnWindowFocus: true/g) || []).length, 9)
   assert.ok(source.includes("refetchInterval: q => livePollInterval(headerQ.data, { kind: 'checks', checks: q.state.data })"))
   assert.equal((source.match(/livePollInterval\(headerQ\.data, \{ kind: 'slow' \}\)/g) || []).length, 2)
   assert.ok(source.includes("const paneVisible = useValue(typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID) : $alwaysVisible)"))
@@ -74,7 +74,7 @@ test('Issue #30: list filter tokens keep row and token actions separate', () => 
 
 test('List filters fetch and expose the same author/label scopes', () => {
   const lists = source.slice(source.indexOf('function PrList'), source.indexOf('function DetailToolbar'))
-  assert.ok(lists.includes('reviewDecision,statusCheckRollup,labels`'))
+  assert.ok(lists.includes("reviewDecision,statusCheckRollup,labels'"))
   assert.equal((lists.match(/setListFilter\(event, 'author'/g) || []).length, 2)
   assert.equal((lists.match(/setListFilter\(event, 'label'/g) || []).length, 2)
 })
@@ -125,8 +125,8 @@ test('Issue #58: Approve is gated on open non-self PRs and wired through approve
   assert.ok(detail.includes('canApprove(prStateKey(d), userQ.data, d.user)'))
   assert.ok(detail.includes('jsx(ApproveControl, { repo, number: d.number })'))
   assert.ok(detail.includes("queryKey: [ID, 'user']"))
-  assert.ok(approve.includes('pr review'))
-  assert.ok(approve.includes('--approve'))
+  assert.ok(approve.includes("operation: 'pr.review'"))
+  assert.ok(approve.includes('}, accountScope)'))
   assert.ok(approve.includes('approvePlan(repo, n)'))
   assert.ok(approve.includes('disabled: isApproving'))
   assert.ok(!approve.includes('if (!me.data)'))
@@ -138,7 +138,7 @@ test('Issue #59: Close/Reopen follows issueAction and shares the confirm panel',
   assert.ok(detail.includes('jsx(IssueControl, { repo, number: d.number, state: d.state })'))
   assert.ok(control.includes('const action = issueAction(state)'))
   assert.ok(control.includes('issuePlan(repo, n, state)'))
-  assert.ok(control.includes('GH} issue ${action}'))
+  assert.ok(control.includes('operation: `issue.${action}`'))
   assert.ok(control.includes("children: action === 'close' ? 'Close issue' : 'Reopen issue'"))
   assert.ok(control.includes('if (!confirming)'))
   assert.ok(!control.includes("if (action === 'close' && !confirming)"))
@@ -196,7 +196,7 @@ test('Issue #55: lists cap explicitly and load more on demand', () => {
   assert.ok(foot.includes("children: 'Retry'"), 'footer: retry missing')
   for (const [name, list] of [['prs', prs], ['issues', issues]]) {
     assert.ok(list.includes('const [limit, setLimit] = useState(30)'), `${name}: limit state missing`)
-    assert.ok(list.includes('--limit ${limit}'), `${name}: limit not wired into the query`)
+    assert.ok(list.includes('repo, state, limit, fields:'), `${name}: limit not wired into the query`)
     assert.ok(list.includes('Showing latest'), `${name}: cap label missing`)
     assert.ok(list.includes('placeholderData: (prev) => prev'), `${name}: growth must hold rows`)
     assert.ok(list.includes('ListMoreFooter({ q, limit, setLimit, allItems })'), `${name}: footer not wired`)
@@ -261,7 +261,7 @@ test('Self-updater shows the installed revision and a one-click update', () => {
   assert.ok(upd.includes('PLUGIN_LEDGER_PATH'), 'revision must come from the install ledger')
   assert.ok(source.includes("const PLUGIN_LEDGER_PATH = '${HERMES_HOME}/plugins/.install-metadata.json'"), 'ledger path must expand $HERMES_HOME')
   // Behind: GitHub compare (shallow installs cannot rev-list), parsed safely.
-  assert.ok(upd.includes('compare/${sq(revision)}...main --jq .ahead_by'), 'behind must come from the GitHub compare with the ledger value quoted')
+  assert.ok(upd.includes("ghApi(PLUGIN_REPO, `compare/${revision}...main`, 'ahead')"), 'behind must come from the GitHub compare with the ledger value quoted')
   assert.ok(upd.includes('parseBehindCount(ahead)'), 'count must go through the tested parser')
   assert.ok(upd.includes('behind: ahead == null ? null : parseBehindCount(ahead)'), 'a failed compare is unknown, never "up to date"')
   assert.ok(upd.includes('if (!revision) return null'), 'no footprint when not an installed package')

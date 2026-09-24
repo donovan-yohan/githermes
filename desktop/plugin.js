@@ -1,19 +1,21 @@
 /**
  * GitHermes — GitHub PRs & Issues as a right workspace pane.
- * GitHub data via `host.request('shell.exec')` + connected `gh`; Bot assignment via gateway session RPCs. No backend.
+ * GitHub data via authenticated plugin REST + private per-command gh credentials.
+ * Local git/session metadata stays on gateway RPCs; credentials never enter the renderer.
  * Session PR: cwd git branch (same join as core review) + transcript URL scan.
- * ponytail: lists page from a 30-row window up to a 120 cap; payloads route through shBig (stdout 4000 cap).
+ * Lists grow from 30 to 120 rows; structured JSON bypasses shell stdout limits.
  */
 import {
   host,
   atom,
   useValue,
-  useQuery,
-  useMutation,
+  useQuery as sdkUseQuery,
+  useMutation as sdkUseMutation,
   queryClient,
   Button,
   Input,
   Textarea,
+  Checkbox,
   Badge,
   CopyButton,
   StatusDot,
@@ -62,7 +64,6 @@ const TRUNK = new Set(['main', 'master', 'dev', 'develop', 'trunk'])
 // with empty stdout. Detect the shell and only prefix where it is valid.
 const POSIX_SHELL = typeof navigator === 'undefined' || !/win/i.test(navigator.platform || navigator.userAgent || '')
 const POSIX_PATH = 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH '
-const GH = `${POSIX_SHELL ? POSIX_PATH : ''}gh`
 const HERMES = `${POSIX_SHELL ? POSIX_PATH : ''}hermes`
 const PLUGIN_NAME = 'githermes'
 // $HERMES_HOME is expanded by the backend shell (profile-aware); double quotes
@@ -94,43 +95,25 @@ const $botAssignments = atom({})
 const PANE_WRAP_CSS = `
 .githermes-pane, .githermes-pane * { box-sizing: border-box; }
 .githermes-pane {
-  width: 100%; max-width: 100%; min-width: 0; overflow: hidden; background: var(--ui-editor-surface-background);
+  width: 100%; max-width: 100%; min-width: 0; overflow: hidden;
+  color: var(--ui-text-primary); font-size: .75rem; line-height: 1rem;
   container-type: inline-size;
 }
 .githermes-pane [data-radix-scroll-area-viewport] > div { display: block !important; min-width: 0 !important; width: 100% !important; }
 .githermes-pane :is(h1, h2, h3, h4, h5, h6, p, li, a, span, code, summary, td, th, blockquote) { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
 .githermes-pane pre { max-width: 100%; overflow-x: auto; }
 /* Runtime plugins need scoped divide color because Tailwind variants are not compiled. */
-.githermes-pane .gh-divide > :not(:last-child) { border-bottom: 1px solid var(--ui-stroke-secondary); }
+.githermes-pane .gh-divide > :not(:last-child) { border-bottom: 1px solid var(--ui-stroke-tertiary); }
 .githermes-pane .gh-shell-header {
   background: var(--ui-editor-surface-background);
   box-shadow: inset 0 -1px var(--ui-stroke-secondary);
-}
-.githermes-pane .gh-empty-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--ui-stroke-secondary);
-  background: var(--ui-bg-quaternary);
-  color: var(--ui-text-secondary);
-}
-.githermes-pane .gh-repo-trigger {
-  height: 32px;
-  border-radius: 999px;
-  background: transparent;
-  box-shadow: none;
-  border: 1px solid var(--ui-stroke-secondary);
-}
-.githermes-pane .gh-repo-trigger:hover,
-.githermes-pane .gh-repo-trigger[data-state='open'] {
-  background: var(--ui-bg-quinary);
-  box-shadow: none;
 }
 /* Unscoped: the picker popover portals outside .githermes-pane, so the
    gh- prefix alone namespaces these (hover + drop-target affordance).
    Globally visible by construction — keep the gh- prefix unique. */
 .gh-repo-option { cursor: pointer; }
-.gh-repo-option:hover { background: var(--ui-bg-quinary); }
+.gh-repo-option:hover, .gh-repo-option[aria-selected='true'] { background: var(--chrome-action-hover); }
+.gh-repo-option:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
 .gh-repo-grip { cursor: grab; opacity: 0.7; }
 .gh-repo-option:hover .gh-repo-grip { opacity: 1; }
 .gh-repo-option:active .gh-repo-grip { cursor: grabbing; }
@@ -138,50 +121,31 @@ const PANE_WRAP_CSS = `
   border-top: 2px solid var(--ui-accent);
   margin-top: -2px;
 }
-.githermes-pane .gh-list { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+.githermes-pane .gh-list { display: flex; flex-direction: column; gap: 2px; padding: 4px; }
 .githermes-pane .gh-list-row {
-  border: 1px solid var(--ui-stroke-secondary);
-  border-radius: 8px;
-  background: var(--ui-bg-quaternary);
-  transition: border-color 120ms ease, background-color 120ms ease;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  transition: background-color 100ms ease;
 }
 .githermes-pane .gh-list-row:hover {
-  border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-stroke-secondary));
-  background: var(--ui-bg-quinary);
+  background: var(--chrome-action-hover);
 }
 .githermes-pane .gh-list-row:focus-within { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
 .githermes-pane .gh-row-open:focus-visible { outline: none; }
 .githermes-pane .gh-filter-token { cursor: pointer; }
 .githermes-pane .gh-filter-token:hover { text-decoration: underline; }
 .githermes-pane .gh-filter-token:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
-.githermes-pane .gh-list-title { font-size: 13px; line-height: 18px; font-weight: 600; }
-.githermes-pane .gh-list-heading { color: var(--ui-text-tertiary); letter-spacing: .04em; text-transform: uppercase; }
-.githermes-pane .gh-status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 1px solid var(--ui-stroke-secondary);
-  border-radius: 999px;
-  background: var(--ui-bg-editor);
-  padding: 1px 6px;
-  color: var(--ui-text-secondary);
-  white-space: nowrap;
-}
+.githermes-pane .gh-list-title { font-size: .75rem; line-height: 1rem; font-weight: 500; }
+.githermes-pane .gh-list-heading { color: var(--ui-text-tertiary); font-weight: 500; }
 .githermes-pane .gh-card-arrow { color: var(--ui-text-quaternary); opacity: .5; }
 .githermes-pane .gh-list-row:hover .gh-card-arrow { color: var(--ui-accent); opacity: 1; }
-.githermes-pane .gh-empty {
-  min-height: 280px;
-  background: transparent;
-}
-.githermes-pane .gh-empty-icon { width: 48px; height: 48px; border-radius: 14px; font-size: 20px; }
 .githermes-pane .gh-detail-summary {
   position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  background-color: var(--ui-bg-quaternary);
-  background-image: radial-gradient(circle, color-mix(in srgb, var(--ui-stroke-secondary) 55%, transparent) 0.65px, transparent 0.7px);
-  background-size: 8px 8px;
+  background: transparent;
 }
 .githermes-pane .gh-detail-title { display: block; }
 .githermes-pane .gh-detail-title .gh-item-num { white-space: nowrap; }
@@ -205,11 +169,8 @@ const PANE_WRAP_CSS = `
   max-height: 8rem;
   overflow-y: auto;
 }
-.githermes-pane .gh-detail-tabs { background: var(--ui-editor-surface-background); }
-.githermes-pane .gh-detail-tabs > div { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.githermes-pane .gh-detail-tabs button,
-.githermes-pane .gh-list-tabs button { min-width: 0; overflow: hidden; padding-inline: 6px; text-overflow: ellipsis; white-space: nowrap; }
-.githermes-pane .gh-list-tabs > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* Scroll the wrapper, not the SDK's track/buttons: native sizes stay intact. */
+.githermes-pane .gh-detail-tabs { overflow-x: auto; }
 .githermes-pane .gh-comment-action { opacity: .45; transition: opacity 120ms ease; }
 .githermes-pane .gh-comment:hover .gh-comment-action,
 .githermes-pane .gh-comment:focus-within .gh-comment-action { opacity: 1; }
@@ -239,10 +200,6 @@ const PANE_WRAP_CSS = `
 .githermes-pane .gh-commit > summary::-webkit-details-marker { display: none; }
 .githermes-pane .gh-commit-panel { margin-left: 26px; margin-top: 8px; padding-bottom: 4px; }
 .githermes-pane .gh-narrow-only { display: none; }
-@container (max-width: 359px) {
-  .githermes-pane .gh-detail-tabs > div { display: flex; width: 100%; overflow-x: auto; }
-  .githermes-pane .gh-detail-tabs button { flex: none; min-width: max-content; }
-}
 @container (max-width: 299px) {
   .githermes-pane .gh-comment { display: block; }
   .githermes-pane .gh-comment-avatar { display: none; }
@@ -394,6 +351,11 @@ function DiffCount({ add, del, className }) {
 }
 
 function openGithubPane() {
+  if (typeof host.revealPane === 'function') {
+    host.revealPane(PANE_ID)
+    return
+  }
+  // Legacy reveal path; older desktops still need the host close-policy update.
   try {
     window.dispatchEvent(new CustomEvent(REVEAL, { detail: { id: PANE_ID, mode: 'open' } }))
   } catch { /* older shells ignore */ }
@@ -535,6 +497,184 @@ function resolveBash() {
   return bashReady
 }
 
+// GitHub REST transport: durable server leases; only login persists in UI storage.
+export const githubAccountState = atom({ context: '', accounts: [], login: '', lease: '', epoch: 0, generation: 0, ready: false, pending: false, error: '' })
+let accountGeneration = 0
+let accountLoading = null
+const backendSelections = new Map()
+let accountSubscriptions = []
+export function bindGitHubAccountLifetime(ctx) {
+  accountSubscriptions.forEach(dispose => dispose())
+  let live = true
+  const invalidate = () => {
+    const current = githubAccountState.get(), context = githubContext()
+    accountLoading = null
+    githubAccountState.set({ ...current, context, generation: ++accountGeneration, ready: false, pending: host.state.gateway?.get?.() === 'open', error: '', ...(current.context === context ? {} : { accounts: [], login: '' }) })
+    queueMicrotask(() => { if (live && host.state.gateway?.get?.() === 'open') refreshGitHubAccounts().catch(() => {}) })
+  }
+  accountSubscriptions = [host.state.connectionId, host.state.profile, host.state.gateway].map(value => value?.listen?.(invalidate)).filter(Boolean)
+  const subscriptions = accountSubscriptions
+  ctx.onDispose?.(() => {
+    live = false
+    subscriptions.forEach(dispose => dispose())
+    accountLoading = null
+    githubAccountState.set({ ...githubAccountState.get(), generation: ++accountGeneration, ready: false, pending: false })
+  })
+}
+function githubContext() { return JSON.stringify([host.state.connectionId?.get?.() ?? '', host.state.profile?.get?.() ?? 'default']) }
+function contextError() { const error = new Error('GitHub account changed or disconnected'); error.code = 'INBOX_CONTEXT_CHANGED'; return error }
+export function captureGitHubScope() { return { ...githubAccountState.get() } }
+export function assertGitHubScope(scope) {
+  const current = githubAccountState.get()
+  if (!scope.ready || !current.ready || scope.context !== githubContext() || scope.context !== current.context || scope.generation !== current.generation || host.state.gateway?.get?.() !== 'open') throw contextError()
+}
+function accountPath(path, context) { return `${path}?profile=${encodeURIComponent(JSON.parse(context)[1])}` }
+function accountRest(path, context, options = {}) {
+  if (context !== githubContext() || host.state.gateway?.get?.() !== 'open') throw contextError()
+  if (!pluginCtx?.rest) throw new Error('GitHub backend unavailable')
+  return pluginCtx.rest(accountPath(path, context), { timeoutMs: 180_000, ...options })
+}
+export async function githubOperation(operation, scope = captureGitHubScope()) {
+  assertGitHubScope(scope)
+  const result = await accountRest('/operation', scope.context, { method: 'POST', body: { lease: scope.lease, epoch: scope.epoch, operation } })
+  assertGitHubScope(scope)
+  if (result.backend !== scope.backend) throw new Error('GitHub backend routing changed')
+  return result.data
+}
+export function scopedGitHubQueryKey(key, scope = captureGitHubScope()) {
+  return [...key, { connectionProfile: scope.context, login: scope.login, generation: scope.generation, epoch: scope.epoch, lease: scope.lease }]
+}
+function useQuery(options) {
+  const scope = useValue(githubAccountState)
+  const connection = useValue(host.state.connectionId)
+  const profile = useValue(host.state.profile)
+  const gateway = useValue(host.state.gateway)
+  const local = ['session-git', 'bots'].includes(options.queryKey?.[1])
+  useEffect(() => { if (!local && gateway === 'open') refreshGitHubAccounts().catch(() => {}) }, [connection, profile, gateway, local])
+  return sdkUseQuery({ ...options,
+    queryKey: scopedGitHubQueryKey(options.queryKey, scope),
+    enabled: (options.enabled ?? true) && (local || (scope.ready && scope.context === githubContext() && host.state.gateway?.get?.() === 'open')),
+    // Never carry previous-user placeholder rows into a new account's cache.
+    placeholderData: options.placeholderData ? (prev, query) => JSON.stringify(query?.queryKey?.at(-1)) === JSON.stringify(scopedGitHubQueryKey([], scope)[0]) ? prev : undefined : undefined,
+    queryFn: async (...args) => { if (!local) assertGitHubScope(scope); const result = await options.queryFn(...args); if (!local) assertGitHubScope(scope); return result },
+  })
+}
+function useMutation(options) {
+  const scope = useValue(githubAccountState)
+  return sdkUseMutation({ ...options, mutationFn: async (...args) => { assertGitHubScope(scope); const result = await options.mutationFn(...args); assertGitHubScope(scope); return result } })
+}
+// One queue per remote connection, not per profile: GET and POST can land in
+// different backend processes, but share a durable authority on that gateway.
+const accountQueues = new Map()
+function serializeAccount(context, run) {
+  const connection = JSON.parse(context)[0]
+  const previous = accountQueues.get(connection) || Promise.resolve()
+  const next = previous.catch(() => {}).then(run)
+  accountQueues.set(connection, next)
+  next.finally(() => { if (accountQueues.get(connection) === next) accountQueues.delete(connection) }).catch(() => {})
+  return next
+}
+function clientSelection(connection) {
+  if (!backendSelections.has(connection)) {
+    // Capability exists BEFORE the first request. A lost response can always be
+    // revoked without creating a second, orphaned client authority.
+    const bytes = crypto.getRandomValues(new Uint8Array(32))
+    const lease = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+    backendSelections.set(connection, { lease, epoch: 0 })
+  }
+  return backendSelections.get(connection)
+}
+async function revokeSelection(context) {
+  const connection = JSON.parse(context)[0], previous = backendSelections.get(connection)
+  if (!previous) return
+  const revoked = await accountRest('/revoke', context, { method: 'POST', body: { lease: previous.lease, epoch: previous.epoch } })
+  // Unknown/expired is an authoritative successful revoke (with a tombstone).
+  // Transport errors are NOT proof of revocation: retain the capability.
+  backendSelections.set(connection, revoked)
+}
+async function selectAccountInside(login, accounts, backend, context, generation) {
+  if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+  const connection = JSON.parse(context)[0], previous = clientSelection(connection)
+  const selected = await accountRest('/selection', context, { method: 'POST', body: { login, lease: previous.lease, epoch: previous.epoch } })
+  backendSelections.set(connection, selected)
+  if (generation !== accountGeneration || context !== githubContext()) {
+    // Same connection, new profile: clean up before letting its queued request
+    // select. A different connection cannot be addressed through this SDK;
+    // retain the capability and revoke on return (otherwise server TTL expires).
+    if (connection === JSON.parse(githubContext())[0] && host.state.gateway?.get?.() === 'open') await revokeSelection(githubContext())
+    throw contextError()
+  }
+  if (selected.backend !== backend) throw new Error('GitHub backend routing changed')
+  pluginCtx.storage.set(`account:${context}`, login)
+  githubAccountState.set({ context, accounts, ...selected, generation, ready: true, pending: false, error: '' })
+}
+export async function selectGitHubAccount(login, accounts = githubAccountState.get().accounts, backend = githubAccountState.get().backend) {
+  const context = githubContext(), generation = ++accountGeneration
+  githubAccountState.set({ ...githubAccountState.get(), context, accounts, login, generation, ready: false, pending: true, error: '' })
+  try {
+    await serializeAccount(context, () => selectAccountInside(login, accounts, backend, context, generation))
+  } catch (error) {
+    if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), ready: false, pending: false, error: error.message })
+    throw error
+  }
+}
+export async function refreshGitHubAccounts(force = false) {
+  const context = githubContext(), current = githubAccountState.get()
+  if (accountLoading?.context === context) return accountLoading.promise
+  if (!force && current.context === context && current.ready) return current
+  const generation = ++accountGeneration
+  githubAccountState.set({ ...current, context, generation, ready: false, pending: true, error: '' })
+  const promise = serializeAccount(context, async () => {
+    try {
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      await revokeSelection(context)
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      const result = await accountRest('/accounts', context)
+      if (generation !== accountGeneration || context !== githubContext()) throw contextError()
+      const accounts = result.accounts || []
+      const saved = pluginCtx.storage.get(`account:${context}`)
+      const login = saved || accounts.find(a => a.active)?.login || accounts[0]?.login
+      if (!login || !accounts.some(a => a.login === login)) {
+        githubAccountState.set({ ...githubAccountState.get(), accounts, backend: result.backend, login: saved || '', pending: false, error: 'GitHub account unavailable' })
+        return
+      }
+      await selectAccountInside(login, accounts, result.backend, context, generation)
+    } catch (error) {
+      if (generation === accountGeneration && context === githubContext()) githubAccountState.set({ ...githubAccountState.get(), pending: false, error: error.message })
+      throw error
+    } finally { if (accountLoading?.generation === generation) accountLoading = null }
+  })
+  accountLoading = { context, promise, generation }
+  return promise
+}
+export function GitHubAccountSelector() {
+  const state = useValue(githubAccountState)
+  const gateway = useValue(host.state.gateway)
+  const choose = login => {
+    if (state.context !== githubContext() || state.generation !== githubAccountState.get().generation || state.pending || gateway !== 'open') return
+    selectGitHubAccount(login).catch(() => {})
+  }
+  if (state.accounts.length < 2) {
+    const only = state.accounts[0]
+    return only && !state.ready && state.login !== only.login
+      ? jsx(Button, { variant: 'ghost', size: 'xs', disabled: state.pending || gateway !== 'open', onClick: () => choose(only.login), children: `Use ${only.login}` })
+      : null
+  }
+  return jsxs(Select, { value: state.login, disabled: state.pending || gateway !== 'open', onValueChange: choose, children: [
+    jsx(SelectTrigger, { 'aria-label': 'GitHub account', className: 'h-7 text-xs', children: jsx(SelectValue, {}) }),
+    jsx(SelectContent, { children: state.accounts.map(a => jsx(SelectItem, { value: a.login, children: a.login }, a.login)) }),
+  ] })
+}
+export function projectGitHubData(data, projection) {
+  if (projection === 'compare') return { ahead: data.ahead_by, behind: data.behind_by }
+  if (projection === 'ahead') return data.ahead_by
+  if (projection.includes('mergeable_state')) return { ...data, user: data.user?.login ?? '', base: data.base?.ref ?? '', head: data.head?.ref ?? '', body: data.body ?? '' }
+  if (projection.includes('msg:.commit.message')) return { msg: data.commit?.message, additions: data.stats?.additions, deletions: data.stats?.deletions, files: (data.files || []).slice(0, 20).map(({ filename, status, additions, deletions }) => ({ filename, status, additions, deletions })) }
+  if (projection.includes('submitted_at')) return data.slice(0, 15).map(r => ({ ...r, user: r.user?.login ?? '', body: r.body ?? '' }))
+  if (projection.includes('full:.sha')) return data.slice(0, 30).map(c => ({ sha: c.sha.slice(0, 7), full: c.sha, msg: c.commit?.message?.split('\n')[0] ?? '', author: c.commit?.author?.name ?? c.author?.login ?? '—', date: c.commit?.author?.date ?? '' }))
+  throw new Error('Unsupported GitHub projection')
+}
+
 async function shellCommand(cmd) {
   await resolveBash()
   if (POSIX_SHELL) return cmd
@@ -551,8 +691,14 @@ async function shellCommand(cmd) {
   return `"${bashPath}" -l -c "echo ${b64} | tr -d '\\r\\n' | base64 -d > /tmp/gt$$.sh; bash /tmp/gt$$.sh; e=$?; unlink /tmp/gt$$.sh; exit $e"`
 }
 
-async function sh(cmd) {
-  const r = await host.request('shell.exec', { command: await shellCommand(cmd) })
+async function sh(cmd, guard = () => {}) {
+  if (typeof cmd === 'object') { guard(); const value = await githubOperation(cmd); guard(); return typeof value === 'string' ? value : JSON.stringify(value) }
+  if (/\bgh\s/.test(cmd)) throw new Error('Unsupported GitHub transport')
+  guard()
+  const command = await shellCommand(cmd)
+  guard() // No await between identity check and dispatch.
+  const r = await host.request('shell.exec', { command })
+  guard()
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || `exit ${r.code}`).trim().slice(0, 600))
   return (r.stdout || '').trim()
 }
@@ -566,24 +712,11 @@ function utf8ToB64(text) {
 }
 
 async function postIssueComment(repo, number, text) {
-  const tag = `ghprs.cmt.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-  const file = `/tmp/${tag}`
-  const b64 = `/tmp/${tag}.b64`
-  try {
-    const encoded = utf8ToB64(text)
-    await sh(`: > ${sq(b64)}`)
-    for (let i = 0; i < encoded.length; i += 1800) {
-      await sh(`printf %s ${sq(encoded.slice(i, i + 1800))} >> ${sq(b64)}`)
-    }
-    await sh(`{ base64 -d < ${sq(b64)} || base64 -D < ${sq(b64)}; } > ${sq(file)}`)
-    await sh(`${GH} api ${sq(`repos/${repoApiPath(repo)}/issues/${number}/comments`)} --method POST -F ${sq(`body=@${file}`)} --silent`)
-  } finally {
-    sh(`unlink ${sq(file)}; unlink ${sq(b64)}`).catch(() => {})
-  }
+  return githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/issues/${number}/comments`, method: 'POST', body: { body: text } })
 }
 
-async function shJson(cmd) {
-  const out = await sh(cmd)
+async function shJson(cmd, guard) {
+  const out = await sh(cmd, guard)
   if (!out) return null
   try { return JSON.parse(out) } catch { throw new Error('gh JSON parse failed: ' + out.slice(0, 300)) }
 }
@@ -636,18 +769,14 @@ export function repoApiPath(repo) {
   return repo.split('/').map(part => /^\.+$/.test(part) ? part.replaceAll('.', '%2E') : part).join('/')
 }
 
-// Compact GitHub REST via jq so shell.exec's 4k stdout cap doesn't truncate.
+// Structured REST with the existing view projections applied locally.
 async function ghApi(repo, path, jq) {
   if (!repoOk(repo)) throw new Error('invalid repo')
-  return shJson(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}`)} --jq ${sq(jq)}`)
+  return projectGitHubData(await githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/${path}` }), jq)
 }
 
-// shell.exec returns only the LAST 4000 chars of stdout (gateway cap), so big
-// payloads (full comment bodies) can't come back in one call. Route them through
-// a temp file read back in base64 chunks — base64 is pure ASCII, so a chunk
-// boundary can never split a multi-byte char the way raw-byte chunking would.
-// ponytail: chunk reads still cost N concurrent shell.exec calls; swap for one
-// call if the gateway cap is raised or a file-read RPC lands.
+// Legacy pure chunk helpers retained for compatibility tests. No GitHub
+// operation uses these helpers: REST returns parsed, redacted JSON directly.
 export function deriveChunkOffsets(byteLength, chunkSize = 3800) {
   if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new Error('invalid chunk byte length')
   if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) throw new Error('invalid chunk size')
@@ -671,32 +800,31 @@ export async function readChunksConcurrently(byteLength, readChunk, options = {}
   return chunks.join('')
 }
 
-async function shBig(cmd) {
-  const tag = `ghprs.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-  const raw = `/tmp/${tag}.raw`, b64 = `/tmp/${tag}.b64`
-  try {
-    await sh(`${cmd} > ${sq(raw)} && base64 < ${sq(raw)} > ${sq(b64)}`)
-    const byteLength = Number(await sh(`wc -c < ${sq(b64)}`))
-    const out = await readChunksConcurrently(
-      byteLength,
-      off => sh(`tail -c +${off} ${sq(b64)} | head -c 3800`),
-    )
-    const bin = atob(out.replace(/\s+/g, ''))
-    return new TextDecoder('utf-8').decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
-  } finally {
-    sh(`unlink ${sq(raw)}; unlink ${sq(b64)}`).catch(() => {})
+export function decodeShellPayload(out) {
+  const encoded = out.replace(/\s+/g, '')
+  if (encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new Error('GitHub transport error: response altered or truncated by host.')
   }
+  const bin = atob(encoded)
+  return new TextDecoder('utf-8').decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
 }
 
-async function shJsonBig(cmd) {
-  const out = await shBig(cmd)
+// Historical helper names, now accepting only structured GitHub operations.
+async function shBig(cmd, guard) {
+  if (typeof cmd !== 'object') throw new Error('Unsupported GitHub transport')
+  guard?.()
+  return JSON.stringify(await githubOperation(cmd))
+}
+
+async function shJsonBig(cmd, guard) {
+  const out = await shBig(cmd, guard)
   if (!out) return null
   try { return JSON.parse(out) } catch { throw new Error('gh JSON parse failed: ' + out.slice(0, 300)) }
 }
 
 async function ghApiBig(repo, path, jq) {
   if (!repoOk(repo)) throw new Error('invalid repo')
-  return shJsonBig(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}`)} --jq ${sq(jq)}`)
+  return ghApi(repo, path, jq)
 }
 
 async function ghApiBigPaginated(repo, path) {
@@ -704,10 +832,11 @@ async function ghApiBigPaginated(repo, path) {
   // gh cannot combine --slurp with --jq, so flatten the raw page array here.
   // Capped walk instead of --paginate: a giant thread would otherwise degrade
   // every poll linearly. Stops at PAGINATED_PAGE_CAP; an empty page ends it.
+  const scope = captureGitHubScope()
   const sep = path.includes('?') ? '&' : '?'
   const out = []
   for (let page = 1; page <= PAGINATED_PAGE_CAP; page++) {
-    const items = await shJsonBig(`${GH} api ${sq(`repos/${repoApiPath(repo)}/${path}${sep}page=${page}`)}`)
+    const items = await githubOperation({ operation: 'github.api', path: `repos/${repoApiPath(repo)}/${path}${sep}page=${page}` }, scope)
     if (!Array.isArray(items) || !items.length) break
     out.push(...items)
   }
@@ -772,24 +901,14 @@ async function ghApiBigPaginatedProjected(repo, path, jq) {
 }
 
 async function fetchPrByNumber(repo, n) {
-  return shJsonBig(`${GH} pr view ${sq(String(n))} --repo ${sq(repo)} --json number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup`)
+  return shJsonBig({ operation: 'pr.view', repo, number: n, fields: 'number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup' })
 }
 
 async function fetchIssueByNumber(repo, n) {
-  return shJsonBig(`${GH} issue view ${sq(String(n))} --repo ${sq(repo)} --json number,title,state,author,updatedAt,url,labels`)
+  return shJsonBig({ operation: 'issue.view', repo, number: n, fields: 'number,title,state,author,updatedAt,url,labels' })
 }
 
-async function shJsonLoose(cmd) {
-  const r = await host.request('shell.exec', { command: await shellCommand(cmd) })
-  const out = (r.stdout || '').trim()
-  if (!out) {
-    if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim().slice(0, 400))
-    return null
-  }
-  try { return JSON.parse(out) } catch {
-    throw new Error('gh JSON parse failed: ' + out.slice(0, 300))
-  }
-}
+async function shJsonLoose(operation) { return githubOperation(operation) }
 
 export function prStateKey(d) {
   if (!d) return 'open'
@@ -1094,6 +1213,7 @@ export function getGitHubShellStore() {
   // Hot reload: the cached store was built by an older plugin build, so atoms
   // added since must be backfilled here or fresh modules dereference undefined.
   if (!store.repoOrder) store.repoOrder = atom(null)
+  if (!store.mode) store.mode = atom('repository')
   return store
 }
 
@@ -1116,6 +1236,7 @@ const {
 // the same commit independently. Any other repo change mismatches and clears.
 let suppressRepoResetFor = null
 function navigateToSessionPr(repo, number) {
+  setGitHubMode('repository')
   if (repo && repo !== $repo.get()) suppressRepoResetFor = repo
   if (repo) $repo.set(repo)
   $tab.set('prs')
@@ -1127,7 +1248,7 @@ function useRepos() {
   return useQuery({
     queryKey: [ID, 'repos'],
     queryFn: async () => {
-      const repos = await shJson(`${GH} repo list --limit 30 --json nameWithOwner`)
+      const repos = await shJson({ operation: 'repo.list', limit: 30, fields: 'nameWithOwner' })
       if (!Array.isArray(repos)) throw new Error('gh repo list failed')
       return repos.map(r => r.nameWithOwner).sort()
     },
@@ -1207,7 +1328,7 @@ function useSessionPr(cwd, sessionId) {
     enabled: !!repo && !!branch && !isTrunk,
     refetchInterval: MEDIUM_POLL_MS,
     queryFn: async () => {
-      const list = await shJson(`${GH} pr list --repo ${sq(repo)} --head ${sq(branch)} --limit 5 --json number,title,state,isDraft,url,headRefName,baseRefName`)
+      const list = await shJson({ operation: 'pr.list', repo, head: branch, limit: 5, fields: 'number,title,state,isDraft,url,headRefName,baseRefName' })
       return Array.isArray(list) && list.length ? { ...list[0], repo, source: 'branch' } : null
     },
     staleTime: 15_000,
@@ -1218,9 +1339,11 @@ function useSessionPr(cwd, sessionId) {
     enabled: !!sessionId && !branchQ.data && !branchQ.isFetching,
     refetchInterval: MEDIUM_POLL_MS,
     queryFn: async () => {
+      const scope = captureGitHubScope()
       const r = await host.request('session.history', { session_id: sessionId }).catch(() => null)
+      assertGitHubScope(scope)
       return resolveTranscriptPr(r?.messages, hit =>
-        shJson(`${GH} pr view ${sq(String(hit.number))} --repo ${sq(hit.repo)} --json number,title,state,isDraft,url,headRefName,baseRefName`))
+        shJson({ operation: 'pr.view', repo: hit.repo, number: hit.number, fields: 'number,title,state,isDraft,url,headRefName,baseRefName' }))
     },
     staleTime: 30_000,
   })
@@ -1228,66 +1351,52 @@ function useSessionPr(cwd, sessionId) {
   return { gitQ, pr: branchQ.data || histQ.data || null, loading: gitQ.isLoading || branchQ.isLoading || histQ.isLoading }
 }
 
+// Shared semantic tones; the SDK owns color, geometry and theme adaptation.
 function StateDot({ state, isDraft }) {
-  const color = isDraft ? 'var(--ui-text-quaternary)'
-    : state === 'OPEN' || state === 'open' ? 'var(--ui-green)'
-    : state === 'MERGED' ? 'var(--ui-purple)'
-    : state === 'CLOSED' ? 'var(--ui-red)'
-    : 'var(--ui-yellow)'
-  return jsx('span', { className: 'inline-block size-2 rounded-full shrink-0', style: { background: color } })
+  const key = String(state || '').toLowerCase()
+  const tone = isDraft ? 'muted' : key === 'closed' ? 'bad' : ['open', 'merged'].includes(key) ? 'good' : 'warn'
+  return jsx(StatusDot, { tone })
 }
 
-// Issue #10: compact CI + review dots on each PR row (native title = tooltip).
-const CI_DOT = { passing: 'var(--ui-green)', failing: 'var(--ui-red)', pending: 'var(--ui-yellow)', none: 'var(--ui-text-quaternary)' }
+const CI_TONE = { passing: 'good', failing: 'bad', pending: 'warn', none: 'muted' }
 const CI_LABEL = { passing: 'CI passing', failing: 'CI failing', pending: 'CI pending', none: 'No CI configured' }
-const REVIEW_DOT = { approved: 'var(--ui-green)', changes: 'var(--ui-red)', required: 'var(--ui-yellow)', none: 'var(--ui-text-quaternary)' }
+const REVIEW_TONE = { approved: 'good', changes: 'bad', required: 'warn', none: 'muted' }
 const REVIEW_LABEL = { approved: 'Approved', changes: 'Changes requested', required: 'Review required', none: 'No review decision' }
 function StatusDots({ pr }) {
   const ci = ciState(pr.statusCheckRollup)
   const rv = reviewState(pr.reviewDecision)
-  return jsxs('span', { className: 'inline-flex flex-wrap items-center gap-1 text-[10px]', children: [
-    jsxs('span', { className: 'gh-status-chip', title: CI_LABEL[ci], children: [
-      jsx('span', { className: 'size-1.5 rounded-full', style: { background: CI_DOT[ci] } }),
-      CI_LABEL[ci],
-    ] }),
-    jsxs('span', { className: 'gh-status-chip', title: REVIEW_LABEL[rv], children: [
-      jsx('span', { className: 'size-1.5 rounded-full', style: { background: REVIEW_DOT[rv] } }),
-      REVIEW_LABEL[rv],
-    ] }),
+  return jsxs('span', { className: 'inline-flex flex-wrap items-center gap-1', children: [
+    jsxs(Badge, { variant: 'muted', children: [jsx(StatusDot, { tone: CI_TONE[ci] }), CI_LABEL[ci]] }),
+    jsxs(Badge, { variant: 'muted', children: [jsx(StatusDot, { tone: REVIEW_TONE[rv] }), REVIEW_LABEL[rv]] }),
   ] })
 }
 
-// GitHub-style state pill, themed via skin vars (inline style => reskins live).
 const STATE_PILL = {
-  merged: { bg: 'var(--ui-purple)', label: 'Merged', icon: 'git-merge' },
-  closed: { bg: 'var(--ui-red)', label: 'Closed', icon: 'git-pull-request-closed' },
-  draft: { bg: 'var(--ui-text-quaternary)', label: 'Draft', icon: 'git-pull-request' },
-  open: { bg: 'var(--ui-green)', label: 'Open', icon: 'git-pull-request' },
+  merged: { variant: 'default', label: 'Merged', icon: 'git-merge' },
+  closed: { variant: 'destructive', label: 'Closed', icon: 'git-pull-request-closed' },
+  draft: { variant: 'muted', label: 'Draft', icon: 'git-pull-request' },
+  open: { variant: 'default', label: 'Open', icon: 'git-pull-request' },
 }
 function StatePill({ d }) {
   const m = STATE_PILL[prStateKey(d)] || STATE_PILL.open
-  return jsxs('span', {
-    className: 'inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium',
-    style: { background: 'var(--ui-bg-editor)', color: m.bg, border: `1px solid ${m.bg}` },
-    children: [jsx(Codicon, { name: m.icon }), m.label],
-  })
+  return jsxs(Badge, { variant: m.variant, children: [jsx(Codicon, { name: m.icon }), m.label] })
 }
 
 function TitlebarGithubButton() {
-  return jsx(Tip, {
-    label: 'Open GitHub pane',
-    children: jsx(Button, {
-      variant: 'ghost',
-      size: 'sm',
-      className: 'h-6 px-2 gap-1.5',
-      onClick: openGithubPane,
-      children: jsxs('span', {
-        className: 'flex items-center gap-1.5',
-        children: [
-          jsx(Codicon, { name: 'github' }),
-          jsx('span', { className: 'hidden sm:inline text-xs font-medium', children: 'GitHub' }),
-        ],
-      }),
+  return jsx(Button, {
+    variant: 'ghost',
+    size: 'sm',
+    'aria-label': 'GitHub',
+    onClick: () => {
+      if (typeof host.togglePane === 'function') host.togglePane(PANE_ID)
+      else openGithubPane()
+    },
+    children: jsxs('span', {
+      className: 'flex items-center gap-1.5',
+      children: [
+        jsx(Codicon, { name: 'github' }),
+        jsx('span', { className: 'hidden sm:inline text-xs font-medium', children: 'GitHub' }),
+      ],
     }),
   })
 }
@@ -1337,7 +1446,9 @@ function PluginUpdateStatus() {
     refetchInterval: MEDIUM_POLL_MS,
     staleTime: 15_000,
     queryFn: async () => {
+      const scope = captureGitHubScope()
       const meta = await sh(`cat "${PLUGIN_LEDGER_PATH}"`).catch(() => '')
+      assertGitHubScope(scope)
       let entry = null
       try { entry = JSON.parse(meta)[PLUGIN_NAME] } catch { entry = null }
       const revision = typeof entry?.revision === 'string' ? entry.revision : null
@@ -1348,13 +1459,12 @@ function PluginUpdateStatus() {
         // No compare call at all when already there — the common case.
         // Braces quoted via sq(): the jq object holds a comma, which bash
         // would otherwise brace-expand.
-        const cmp = pin === revision ? null : await shJson(
-          `${GH} api repos/${PLUGIN_REPO}/compare/${sq(revision)}...${sq(pin)} --jq ${sq('{ahead: .ahead_by, behind: .behind_by}')}`).catch(() => null)
+        const cmp = pin === revision ? null : await ghApi(PLUGIN_REPO, `compare/${revision}...${pin}`, 'compare').catch(() => null)
         return { revision, ...resolvePinBehind(revision, pin, cmp), basis: 'pin' }
       }
       // A failed compare (offline, rate-limited, unresolvable revision) is
       // unknown, never "up to date" — behind: null keeps the pill neutral.
-      const ahead = await shJson(`${GH} api repos/${PLUGIN_REPO}/compare/${sq(revision)}...main --jq .ahead_by`).catch(() => null)
+      const ahead = await ghApi(PLUGIN_REPO, `compare/${revision}...main`, 'ahead').catch(() => null)
       return { revision, behind: ahead == null ? null : parseBehindCount(ahead), basis: 'main' }
     },
   })
@@ -1450,6 +1560,7 @@ function RepoLabel({ repo, size = 20 }) {
 }
 
 function RepoPicker({ repos, value, onChange }) {
+  const accountScope = useValue(githubAccountState)
   const OTHER = '__other__'
   const [manualOpen, setManualOpen] = useState(false)
   const [manual, setManual] = useState('')
@@ -1480,7 +1591,7 @@ function RepoPicker({ repos, value, onChange }) {
     const startValue = valueRef.current
     try {
       // Reachability check — format alone is not enough for "inaccessible".
-      const viewed = await shJson(`${GH} repo view ${sq(name)} --json nameWithOwner`)
+      const viewed = await githubOperation({ operation: 'repo.view', repo: name, fields: 'nameWithOwner' }, accountScope)
       // #64 review: value changed while pending (auto-follow / other surface) —
       // a stale completion must not revert the newer selection.
       if (valueRef.current !== startValue) return
@@ -1530,16 +1641,21 @@ function RepoPicker({ repos, value, onChange }) {
           onOpenChange: o => { setOpen(o); resetDrag() },
           children: [
             jsx(PopoverTrigger, {
-              className: 'gh-repo-trigger text-xs flex min-w-0 items-center justify-between gap-2 px-3',
-              'aria-label': 'Select repository',
-              children: jsxs('span', { className: 'flex min-w-0 flex-1 items-center justify-between gap-2', children: [
-                showManual
-                  ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Use another repository…' })
-                  : value
-                    ? jsx(RepoLabel, { repo: value })
-                    : jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Select repository' }),
-                jsx(Codicon, { name: 'chevron-down', size: 12, className: 'shrink-0 opacity-60' }),
-              ] }),
+              asChild: true,
+              children: jsx(Button, {
+                variant: 'secondary',
+                size: 'sm',
+                className: 'min-w-0 justify-between',
+                'aria-label': 'Select repository',
+                children: jsxs('span', { className: 'flex min-w-0 flex-1 items-center justify-between gap-2', children: [
+                  showManual
+                    ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Use another repository…' })
+                    : value
+                      ? jsx(RepoLabel, { repo: value })
+                      : jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Select repository' }),
+                  jsx(Codicon, { name: 'chevron-down', size: 12, className: 'shrink-0 opacity-60' }),
+                ] }),
+              }),
             }),
             jsx(PopoverContent, {
               align: 'start',
@@ -1598,13 +1714,12 @@ function RepoPicker({ repos, value, onChange }) {
                   placeholder: 'owner/repo',
                   value: manual,
                   onChange: e => { setManual(e.target.value); if (error) setError('') },
-                  className: 'h-7 flex-1 text-xs',
+                  className: 'flex-1',
                   'aria-invalid': !!error || undefined,
                 }),
                 jsx(Button, {
                   size: 'sm',
-                  className: 'h-7',
-                  disabled: !manualOk || checking,
+                        disabled: !manualOk || checking,
                   onClick: () => { applyManual() },
                   children: checking ? jsx(GlyphSpinner, {}) : 'Use',
                 }),
@@ -1640,14 +1755,15 @@ export function labelTextColor(hex) {
 
 function LabelChip({ label, className, onClick }) {
   if (!label?.name) return null
-  const bg = label.color ? `#${String(label.color).replace(/^#/, '')}` : 'var(--ui-bg-quaternary)'
-  const color = label.color ? labelTextColor(label.color) : 'var(--ui-text-secondary)'
-  return jsx(onClick ? 'button' : 'span', {
-    type: onClick ? 'button' : undefined,
-    onClick,
-    className: cn('inline-flex items-center px-1.5 py-px rounded-full text-[10px] font-medium leading-none shrink-0', onClick && 'gh-filter-token', className),
-    style: { backgroundColor: bg, color, border: '1px solid color-mix(in srgb, currentColor 18%, transparent)' },
-    children: label.name,
+  // Repository colors are data, not UI theme tokens. Keep metadata native and
+  // readable in every appearance; preserve the label text and filter action.
+  return jsx(Badge, {
+    variant: 'muted',
+    className,
+    asChild: !!onClick,
+    children: onClick
+      ? jsx('button', { type: 'button', onClick, className: 'gh-filter-token', children: label.name })
+      : label.name,
   })
 }
 
@@ -1689,18 +1805,13 @@ export function parsePatch(patch) {
 function FileStatusBadge({ status }) {
   const s = String(status || '').toLowerCase()
   const map = {
-    added: { label: 'A', bg: 'var(--ui-green)', title: 'Added' },
-    removed: { label: 'D', bg: 'var(--ui-red)', title: 'Deleted' },
-    modified: { label: 'M', bg: 'var(--ui-yellow)', title: 'Modified' },
-    renamed: { label: 'R', bg: 'var(--ui-purple)', title: 'Renamed' },
+    added: { label: 'A', variant: 'default', title: 'Added' },
+    removed: { label: 'D', variant: 'destructive', title: 'Deleted' },
+    modified: { label: 'M', variant: 'warn', title: 'Modified' },
+    renamed: { label: 'R', variant: 'muted', title: 'Renamed' },
   }
-  const meta = map[s] || { label: '•', bg: 'var(--ui-text-quaternary)', title: s || 'Changed' }
-  return jsx('span', {
-    className: 'inline-flex items-center justify-center w-3.5 h-3.5 rounded text-[9px] font-bold shrink-0',
-    style: { backgroundColor: 'var(--ui-bg-editor)', color: meta.bg, border: `1px solid ${meta.bg}` },
-    title: meta.title,
-    children: meta.label,
-  })
+  const meta = map[s] || { label: '•', variant: 'muted', title: s || 'Changed' }
+  return jsx(Badge, { variant: meta.variant, size: 'xs', title: meta.title, 'aria-label': meta.title, children: meta.label })
 }
 
 function FileDiffBlock({ file }) {
@@ -1831,7 +1942,7 @@ function CommitRow({ repo, commit }) {
           onClick: e => e.stopPropagation(),
           children: [
             jsx(CopyButton, { appearance: 'inline', className: 'font-mono text-[10px]', label: 'Copy SHA', text: sha, children: commit.sha }),
-            url ? jsx(Button, { variant: 'ghost', size: 'sm', className: 'gh-commit-action h-6 w-6 p-0', 'aria-label': 'Open commit on GitHub', onClick: () => openExternal(url), children: jsx(Codicon, { name: 'link-external' }) }) : null,
+            url ? jsx(Button, { variant: 'ghost', size: 'icon-xs', className: 'gh-commit-action', 'aria-label': 'Open commit on GitHub', onClick: () => openExternal(url), children: jsx(Codicon, { name: 'link-external' }) }) : null,
           ],
         }),
       ] }),
@@ -1943,6 +2054,7 @@ function FilesView({ files, loading, error, onRetry }) {
 
 // Issue #2: Merge PR control (method select, delete-branch checkbox, confirm, error handling)
 function MergeControl({ repo, number, mergeableState, head, base }) {
+  const accountScope = useValue(githubAccountState)
   const [open, setOpen] = useState(false)
   const [method, setMethod] = useState('squash')
   const [deleteBranch, setDeleteBranch] = useState(false)
@@ -1977,10 +2089,8 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
     try {
       const flag = method === 'squash' ? '--squash' : method === 'rebase' ? '--rebase' : '--merge'
       const del = deleteBranch ? ' --delete-branch' : ''
-      // gh pr merge prompts interactively (branch protection, merge queue);
-      // shell.exec has no TTY so it would hang. gh has no --yes on this
-      // subcommand; GH_PROMPT_DISABLED=1 suppresses prompts for this call only.
-      await sh(`GH_PROMPT_DISABLED=1 ${GH} pr merge ${sq(String(number))} --repo ${sq(repo)} ${flag}${del}`)
+      // The private backend disables interactive prompts in its child env.
+      await githubOperation({ operation: 'pr.merge', repo, number, strategy: flag.slice(2), deleteBranch: Boolean(del) }, accountScope)
       queryClient.invalidateQueries({ queryKey: [ID, 'pr-page', repo, String(number)] })
       queryClient.invalidateQueries({ queryKey: [ID, 'pr-checks', repo, String(number)] })
       queryClient.invalidateQueries({ queryKey: [ID, 'prs', repo] })
@@ -1995,8 +2105,8 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
 
   if (!open) {
     return jsxs(Button, {
-      size: 'sm',
-      className: 'h-5 px-2 text-[10px] gap-1 ml-auto',
+      size: 'xs',
+      className: 'ml-auto',
       onClick: () => { setOpen(true); setError(null) },
       children: [
         jsx(Codicon, { name: 'git-merge' }),
@@ -2018,9 +2128,8 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
             jsx('span', { children: 'Merge pull request' }),
           ] }),
           jsx(Button, {
-            size: 'sm',
+            size: 'icon-xs',
             variant: 'ghost',
-            className: 'h-5 w-5 p-0 text-[10px]',
             disabled: isMerging,
             onClick: () => { setOpen(false); setError(null) },
             children: '✕',
@@ -2049,12 +2158,11 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
       jsxs('label', {
         className: 'flex items-center gap-2 text-[11px] text-(--ui-text-secondary) cursor-pointer select-none',
         children: [
-          jsx('input', {
-            type: 'checkbox',
+          jsx(Checkbox, {
             checked: deleteBranch,
-            onChange: e => setDeleteBranch(e.target.checked),
+            onCheckedChange: checked => setDeleteBranch(checked === true),
             disabled: isMerging,
-            className: 'rounded border-(--ui-stroke-secondary)',
+            'aria-label': 'Delete branch after merging',
           }),
           jsx('span', { children: 'Delete branch after merging' }),
         ],
@@ -2069,14 +2177,12 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
           jsx(Button, {
             size: 'sm',
             variant: 'ghost',
-            className: 'h-6 text-xs',
             disabled: isMerging,
             onClick: () => { setOpen(false); setError(null) },
             children: 'Cancel',
           }),
           jsxs(Button, {
             size: 'sm',
-            className: 'h-6 px-2.5 text-xs gap-1.5 disabled:opacity-60',
             disabled: isMerging,
             onClick: handleMerge,
             children: isMerging
@@ -2092,6 +2198,7 @@ function MergeControl({ repo, number, mergeableState, head, base }) {
 // Issue #58: approve an open PR from the detail toolbar. Rendered by PrDetail
 // only when canApprove() gates it in — no viewer fetch of its own.
 function ApproveControl({ repo, number }) {
+  const accountScope = useValue(githubAccountState)
   const n = String(number)
   const [open, setOpen] = useState(false)
   const [isApproving, setIsApproving] = useState(false)
@@ -2101,7 +2208,7 @@ function ApproveControl({ repo, number }) {
     setIsApproving(true)
     setError(null)
     try {
-      await sh(`${GH} pr review ${sq(n)} --repo ${sq(repo)} --approve`)
+      await githubOperation({ operation: 'pr.review', repo, number: n }, accountScope)
       const plan = approvePlan(repo, n)
       await Promise.all(plan.invalidate.map(queryKey => queryClient.invalidateQueries({ queryKey })))
       setOpen(false)
@@ -2114,8 +2221,8 @@ function ApproveControl({ repo, number }) {
 
   if (!open) {
     return jsxs(Button, {
-      size: 'sm',
-      className: 'h-5 px-2 text-[10px] gap-1 ml-auto',
+      size: 'xs',
+      className: 'ml-auto',
       onClick: () => { setOpen(true); setError(null) },
       children: [
         jsx(Codicon, { name: 'git-pull-request' }),
@@ -2135,9 +2242,8 @@ function ApproveControl({ repo, number }) {
             jsx('span', { children: approvePlan(repo, n).confirm }),
           ] }),
           jsx(Button, {
-            size: 'sm',
+            size: 'icon-xs',
             variant: 'ghost',
-            className: 'h-5 w-5 p-0 text-[10px]',
             disabled: isApproving,
             onClick: () => { setOpen(false); setError(null) },
             children: '✕',
@@ -2154,14 +2260,12 @@ function ApproveControl({ repo, number }) {
           jsx(Button, {
             size: 'sm',
             variant: 'ghost',
-            className: 'h-6 text-xs',
             disabled: isApproving,
             onClick: () => { setOpen(false); setError(null) },
             children: 'Cancel',
           }),
           jsxs(Button, {
             size: 'sm',
-            className: 'h-6 px-2.5 text-xs gap-1.5 disabled:opacity-60',
             disabled: isApproving,
             onClick: handleApprove,
             children: isApproving
@@ -2179,6 +2283,7 @@ function ApproveControl({ repo, number }) {
 // for both verbs — reopen used to land on the confirm panel immediately, which
 // made Cancel a no-op (confirming stayed false, panel stayed open).
 function IssueControl({ repo, number, state }) {
+  const accountScope = useValue(githubAccountState)
   const n = String(number)
   const action = issueAction(state)
   const [confirming, setConfirming] = useState(false)
@@ -2191,7 +2296,7 @@ function IssueControl({ repo, number, state }) {
     setIsPending(true)
     setError(null)
     try {
-      await sh(`${GH} issue ${action} ${sq(n)} --repo ${sq(repo)}`)
+      await githubOperation({ operation: `issue.${action}`, repo, number: n }, accountScope)
       const plan = issuePlan(repo, n, state)
       await Promise.all(plan.invalidate.map(queryKey => queryClient.invalidateQueries({ queryKey })))
       setConfirming(false)
@@ -2204,8 +2309,8 @@ function IssueControl({ repo, number, state }) {
 
   if (!confirming) {
     return jsxs(Button, {
-      size: 'sm',
-      className: 'h-5 px-2 text-[10px] gap-1 ml-auto',
+      size: 'xs',
+      className: 'ml-auto',
       disabled: isPending,
       onClick: () => { setConfirming(true); setError(null) },
       children: [
@@ -2228,9 +2333,8 @@ function IssueControl({ repo, number, state }) {
             jsx('span', { children: confirmText }),
           ] }),
           jsx(Button, {
-            size: 'sm',
+            size: 'icon-xs',
             variant: 'ghost',
-            className: 'h-5 w-5 p-0 text-[10px]',
             disabled: isPending,
             onClick: () => { setConfirming(false); setError(null) },
             children: '✕',
@@ -2247,14 +2351,12 @@ function IssueControl({ repo, number, state }) {
           jsx(Button, {
             size: 'sm',
             variant: 'ghost',
-            className: 'h-6 text-xs',
             disabled: isPending,
             onClick: () => { setConfirming(false); setError(null) },
             children: 'Cancel',
           }),
           jsxs(Button, {
             size: 'sm',
-            className: 'h-6 px-2.5 text-xs gap-1.5 disabled:opacity-60',
             disabled: isPending,
             onClick: run,
             children: isPending
@@ -2341,8 +2443,7 @@ function SendToChatButton({ comment, className }) {
   const wrap = cn('inline-flex shrink-0', className)
   const btn = jsx(Button, {
     variant: 'ghost',
-    size: 'sm',
-    className: 'h-6 w-6 p-0',
+    size: 'icon-xs',
     'aria-label': 'Quote in chat',
     disabled: !activeId,
     onClick: () => sendCommentToChat(comment),
@@ -2362,7 +2463,6 @@ function AskHermesButton({ action, repo, number, checkNames, threadUrl, label, c
   const btn = jsx(Button, {
     variant: 'ghost',
     size: 'sm',
-    className: 'h-7 px-2 text-[11px]',
     'aria-label': label,
     disabled: !activeId,
     onClick: e => {
@@ -2555,7 +2655,7 @@ function MdBlocksView({ blocks, keyPrefix }) {
     ] }) }) }, k)
     if (b.t === 'ul') return jsx('ul', { className: 'list-disc pl-5 space-y-0.5', children: b.items.map((it, j) => it.task
       ? jsx('li', { className: 'list-none -ml-5 flex items-start gap-1.5', children: [
-          jsx('input', { type: 'checkbox', checked: it.checked, disabled: true, className: 'mt-1.5 size-3 shrink-0 accent-(--ui-accent)' }, `${k}-cb${j}`),
+          jsx(Checkbox, { checked: it.checked, disabled: true, 'aria-label': it.text, className: 'mt-1' }, `${k}-cb${j}`),
           jsx('span', { className: it.checked ? 'text-(--ui-text-tertiary) line-through' : undefined, children: mdInline(it.text, `${k}-${j}`) }),
         ] }, j)
       : jsx('li', { children: mdInline(it.text, `${k}-${j}`) }, j)) }, k)
@@ -2631,14 +2731,8 @@ function ListEmptyState({ kind, state, repo, query }) {
   const isPr = kind === 'prs'
   const noun = isPr ? 'pull requests' : 'issues'
   const title = query ? 'No matching results' : state === 'all' ? `No ${noun} found` : `No ${state} ${noun}`
-  return jsxs('div', { className: 'gh-empty flex h-full flex-col items-center justify-center px-8 py-10 text-center', children: [
-    jsx('span', { className: 'gh-empty-icon mb-4', children: jsx(Codicon, { name: isPr ? 'git-pull-request' : 'issues' }) }),
-    jsx('h3', { className: 'text-base font-semibold tracking-tight text-(--ui-text-primary)', children: title }),
-    jsx('p', { className: 'mt-1 max-w-64 text-xs leading-5 text-(--ui-text-tertiary)', children: query
-      ? `Nothing matches “${query}”. Try a title, number, author, branch, or label.`
-      : state === 'all'
-      ? `Nothing to show in ${repo}.`
-      : `There are no ${state} ${noun} in this repository.` }),
+  return jsxs('div', { className: 'flex h-full flex-col items-center justify-center p-4 text-center', children: [
+    jsx(EmptyState, { title }),
     jsxs('div', { className: 'mt-4 flex flex-wrap justify-center gap-2', children: [
       query ? jsx(Button, {
         variant: 'outline',
@@ -2672,7 +2766,7 @@ function ListEmptyState({ kind, state, repo, query }) {
 function ListMoreFooter({ q, limit, setLimit, allItems }) {
   if (q.isError) return jsxs('div', { className: 'flex items-center gap-2 px-3 py-2 text-xs text-(--ui-text-tertiary)', children: [
     jsx('span', { className: 'min-w-0 flex-1 truncate', children: `Could not refresh — showing latest ${allItems.length}.` }),
-    jsx(Button, { variant: 'ghost', size: 'sm', className: 'h-6 shrink-0 px-2 text-[11px]', onClick: () => q.refetch(), children: 'Retry' }),
+    jsx(Button, { variant: 'ghost', size: 'sm', className: 'shrink-0', onClick: () => q.refetch(), children: 'Retry' }),
   ] })
   if (allItems.length < limit || limit >= LIST_LIMIT_CAP) return null
   return jsx(Button, {
@@ -2695,7 +2789,7 @@ function PrList({ repo, onOpen, query, active = true }) {
     placeholderData: (prev) => prev,
     // Issue #10: expanded list metadata can overflow the stdout cap, so the
     // list routes through shBig.
-    queryFn: () => shJsonBig(`${GH} pr list --repo ${sq(repo)} --state ${sq(state)} --limit ${limit} --json number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,labels`),
+    queryFn: () => shJsonBig({ operation: 'pr.list', repo, state, limit, fields: 'number,title,state,author,updatedAt,url,baseRefName,headRefName,isDraft,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,labels' }),
     staleTime: 15_000,
     refetchInterval: MEDIUM_POLL_MS,
     refetchOnWindowFocus: true,
@@ -2733,7 +2827,7 @@ function PrList({ repo, onOpen, query, active = true }) {
           jsx(Codicon, { name: 'git-pull-request' }),
           jsx('span', { children: 'Pull requests' }),
           jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: `Showing latest ${allItems.length}` }),
-          jsx(Badge, { variant: 'secondary', className: 'ml-auto h-5 min-w-5 justify-center text-[10px]', children: String(items.length) }),
+          jsx(Badge, { variant: 'muted', className: 'ml-auto', children: String(items.length) }),
         ] }),
         ...items.map(pr =>
         jsxs('div', {
@@ -2780,7 +2874,7 @@ function IssueList({ repo, onOpen, query, active = true }) {
     // Same key-growth hold as the PR list above.
     placeholderData: (prev) => prev,
     // Issue #10: same stdout-cap routing as the PR list (busy repos overflow).
-    queryFn: () => shJsonBig(`${GH} issue list --repo ${sq(repo)} --state ${sq(state)} --limit ${limit} --json number,title,state,author,updatedAt,url,labels`),
+    queryFn: () => shJsonBig({ operation: 'issue.list', repo, state, limit, fields: 'number,title,state,author,updatedAt,url,labels' }),
     staleTime: 15_000,
     refetchInterval: MEDIUM_POLL_MS,
     refetchOnWindowFocus: true,
@@ -2817,7 +2911,7 @@ function IssueList({ repo, onOpen, query, active = true }) {
           jsx(Codicon, { name: 'issues' }),
           jsx('span', { children: 'Issues' }),
           jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: `Showing latest ${allItems.length}` }),
-          jsx(Badge, { variant: 'secondary', className: 'ml-auto h-5 min-w-5 justify-center text-[10px]', children: String(items.length) }),
+          jsx(Badge, { variant: 'muted', className: 'ml-auto', children: String(items.length) }),
         ] }),
         ...items.map(it =>
         jsxs('div', {
@@ -2908,7 +3002,7 @@ function AssignToBot({ kind, repo, number }) {
           type: 'button',
           variant: 'ghost',
           size: 'sm',
-          className: 'h-7 px-1.5 text-xs underline underline-offset-2',
+          className: 'underline underline-offset-2',
           onClick: () => host.openSession(assignment.sessionId, { profile: assignment.profile, intent: 'tab' })
             .catch(error => host.notify?.({ kind: 'error', message: String(error?.message || error) })),
           'aria-label': `Open ${assignment.label} session`,
@@ -2936,7 +3030,6 @@ function AssignToBot({ kind, repo, number }) {
       type: 'button',
       variant: 'ghost',
       size: 'sm',
-      className: 'h-7 px-1.5',
       onClick: () => host.notify?.({ kind: 'error', message: 'Update Hermes Desktop to assign to a bot' }),
       'aria-label': 'Assign to a Bot',
       children: 'Assign to a Bot',
@@ -2970,9 +3063,9 @@ function DetailToolbar({ repo, number, url, title, kind, checkoutCommand, onBack
       ? jsx(AskHermesButton, { action: 'issue', repo, number, label: 'Plan fix for this issue' })
       : null
   return jsxs('div', {
-    className: 'shrink-0 border-b border-(--ui-stroke-secondary) bg-(--ui-editor-surface-background) px-3 py-2 flex items-center gap-1.5 text-xs text-(--ui-text-tertiary)',
+    className: 'shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) px-3 py-2 flex items-center gap-1.5 text-xs text-(--ui-text-tertiary)',
     children: [
-      jsx(Button, { variant: 'ghost', size: 'sm', className: 'h-7 w-7 p-0 -ml-1', onClick: onBack, 'aria-label': backLabel, children: jsx(Codicon, { name: 'chevron-left' }) }),
+      jsx(Button, { variant: 'ghost', size: 'icon-xs', className: '-ml-1', onClick: onBack, 'aria-label': backLabel, children: jsx(Codicon, { name: 'chevron-left' }) }),
       jsxs('span', { className: 'gh-detail-repo min-w-0 flex-1 truncate', children: [
         jsx('span', { children: owner }),
         jsx('span', { className: 'mx-0.5 opacity-50', children: '/' }),
@@ -2983,7 +3076,7 @@ function DetailToolbar({ repo, number, url, title, kind, checkoutCommand, onBack
         jsx(AssignToBot, { kind, repo, number }),
         checkoutCommand ? jsx(CopyButton, { appearance: 'icon', buttonSize: 'icon-sm', label: 'Copy checkout command', text: checkoutCommand }) : null,
         jsx(CopyButton, { appearance: 'icon', buttonSize: 'icon-sm', label: 'Copy GitHub URL', text: url }),
-        jsx(Button, { variant: 'ghost', size: 'sm', className: 'h-7 w-7 p-0', onClick: () => openExternal(url), 'aria-label': 'Open on GitHub', children: jsx(Codicon, { name: 'link-external' }) }),
+        jsx(Button, { variant: 'ghost', size: 'icon-xs', onClick: () => openExternal(url), 'aria-label': 'Open on GitHub', children: jsx(Codicon, { name: 'link-external' }) }),
       ] }) : null,
     ],
   })
@@ -2991,7 +3084,7 @@ function DetailToolbar({ repo, number, url, title, kind, checkoutCommand, onBack
 
 function DetailSummary({ title, number, children }) {
   return jsxs('div', {
-    className: 'gh-detail-summary shrink-0 border-b border-(--ui-stroke-secondary) px-3 py-2',
+    className: 'gh-detail-summary shrink-0 border-b border-(--ui-stroke-tertiary) px-3 py-2',
     children: [
       jsx(ItemTitle, { title, number, detail: true }),
       children,
@@ -3026,7 +3119,7 @@ function CommentComposer({ repo, number, kind, onPosted }) {
   const inflight = useRef(false)
   const me = useQuery({
     queryKey: [ID, 'user'],
-    queryFn: async () => loginOf(await sh(`${GH} api user --jq .login`)),
+    queryFn: async () => loginOf((await githubOperation({ operation: 'github.api', path: 'user' })).login),
     staleTime: 3_600_000,
   })
   const mutation = useMutation({
@@ -3070,7 +3163,7 @@ function CommentComposer({ repo, number, kind, onPosted }) {
       jsxs('div', { className: 'flex items-start gap-2', children: [
         jsx(Avatar, { login: me.data, size: 22 }),
         jsxs('div', { className: 'min-w-0 flex-1 overflow-hidden rounded-md border border-(--ui-stroke-secondary)', children: [
-          expanded ? jsxs('div', { className: 'flex items-center gap-3 border-b border-(--ui-stroke-secondary) px-2.5 pt-1.5', children: [
+          expanded ? jsxs('div', { className: 'flex items-center gap-3 border-b border-(--ui-stroke-tertiary) px-2.5 pt-1.5', children: [
             tab('write', 'Write'),
             tab('preview', 'Preview'),
           ] }) : null,
@@ -3104,8 +3197,7 @@ function CommentComposer({ repo, number, kind, onPosted }) {
             jsx(Button, {
               type: 'submit',
               size: 'sm',
-              className: 'h-6 px-2 text-[11px]',
-              disabled: mutation.isPending || !commentBodyOk(body),
+                disabled: mutation.isPending || !commentBodyOk(body),
               children: mutation.isPending
                 ? jsxs(Fragment, { children: [jsx(GlyphSpinner, { className: 'size-3' }), ' Commenting'] })
                 : 'Comment',
@@ -3172,7 +3264,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
     enabled: !!repo && !!number && active && (page === 'checks' || page === 'conversation'),
     queryFn: async () => {
       try {
-        const rows = await shJsonLoose(`${GH} pr checks ${sq(n)} --repo ${sq(repo)} --json name,state,bucket,link`)
+        const rows = await shJsonLoose({ operation: 'pr.checks', repo, number: n, fields: 'name,state,bucket,link' })
         return Array.isArray(rows) ? rows : []
       } catch (e) {
         // `gh pr checks` exits 1 with "no checks reported…" when the PR has no CI (#23):
@@ -3189,7 +3281,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
   // Same [ID,'user'] cache entry as CommentComposer — one fetch total.
   const userQ = useQuery({
     queryKey: [ID, 'user'],
-    queryFn: async () => loginOf(await sh(`${GH} api user --jq .login`)),
+    queryFn: async () => loginOf((await githubOperation({ operation: 'github.api', path: 'user' })).login),
     staleTime: 3_600_000,
   })
 
@@ -3253,7 +3345,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
             jsx('span', { children: ago(d.created_at) }),
             jsx('span', { className: 'font-mono', children: `${d.head} → ${d.base}` }),
             jsxs('span', { children: [jsx(DiffCount, { add: d.additions, del: d.deletions }), jsx('span', { children: ` · ${d.changed_files ?? 0} files` })] }),
-            d.comments ? jsx(Badge, { variant: 'secondary', className: 'h-5 text-[10px]', children: `${d.comments} comments` }) : null,
+            d.comments ? jsx(Badge, { variant: 'muted', className: 'ml-auto', children: `${d.comments} comments` }) : null,
           ] }),
           prStateKey(d) === 'open' && !d.draft
             ? jsx(MergeControl, { repo, number: d.number, mergeableState: d.mergeable_state, head: d.head, base: d.base })
@@ -3264,7 +3356,7 @@ function PrDetail({ repo, number, onBack, active = true }) {
         ],
       }),
       jsx('div', {
-        className: 'gh-detail-tabs shrink-0 border-b border-(--ui-stroke-secondary) px-3 py-2',
+        className: 'gh-detail-tabs shrink-0 border-b border-(--ui-stroke-tertiary) px-3 py-2',
         children: jsx(SegmentedControl, {
           value: page,
           onChange: setPage,
@@ -3341,7 +3433,7 @@ function IssueDetail({ repo, number, onBack, active = true }) {
   const q = useQuery({
     queryKey: [ID, 'issue-detail', repo, n],
     enabled: !!repo && !!number && active,
-    queryFn: () => shJsonBig(`${GH} issue view ${sq(n)} --repo ${sq(repo)} --json number,title,body,state,author,createdAt,comments,labels,url`),
+    queryFn: () => shJsonBig({ operation: 'issue.view', repo, number: n, fields: 'number,title,body,state,author,createdAt,comments,labels,url' }),
     staleTime: 5_000,
     refetchInterval: query => livePollInterval(query.state.data),
     refetchOnWindowFocus: true,
@@ -3362,7 +3454,7 @@ function IssueDetail({ repo, number, onBack, active = true }) {
             jsx(StatePill, { d }),
             jsx(Person, { login: d.author?.login, size: 16 }),
             jsx('span', { children: ago(d.createdAt) }),
-            jsx(Badge, { variant: 'secondary', className: 'h-5 text-[10px]', children: `${(d.comments || []).length} comments` }),
+            jsx(Badge, { variant: 'muted', className: 'ml-auto', children: `${(d.comments || []).length} comments` }),
             ...(Array.isArray(d.labels) ? d.labels.map(label => jsx(LabelChip, { label }, label.name || label.id)) : []),
           ] }),
           jsx(IssueControl, { repo, number: d.number, state: d.state }),
@@ -3375,7 +3467,7 @@ function IssueDetail({ repo, number, onBack, active = true }) {
           jsxs('section', { className: 'space-y-2', children: [
             jsxs('div', { className: 'flex items-center gap-2 px-0.5', children: [
               jsx('h2', { className: 'text-xs font-semibold text-(--ui-text-secondary)', children: 'Comments' }),
-              jsx(Badge, { variant: 'secondary', className: 'h-5 min-w-5 justify-center text-[10px]', children: String((d.comments || []).length) }),
+              jsx(Badge, { variant: 'muted', className: 'ml-auto', children: String((d.comments || []).length) }),
             ] }),
             (d.comments || []).length
               ? jsx('div', { className: 'gh-timeline', children: d.comments.map(c => jsx(CommentCard, { login: c.author?.login, verb: 'commented', time: ago(c.createdAt), timestamp: c.createdAt, body: c.body, permalink: c.url, size: 16 }, c.id || c.url)) })
@@ -3410,14 +3502,14 @@ function SessionPrBanner() {
     onClick: () => {
       navigateToSessionPr(pr.repo, pr.number)
     },
-    className: 'shrink-0 w-full text-left border-b border-(--ui-stroke-secondary) bg-(--ui-bg-quaternary) px-3 py-2 flex items-center gap-2 hover:bg-(--ui-bg-quinary)',
+    className: 'shrink-0 w-full text-left border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary) px-3 py-2 flex items-center gap-2 hover:bg-(--ui-bg-quinary)',
     children: [
       jsx(StateDot, { state: pr.state, isDraft: pr.isDraft }),
       jsxs('span', { className: 'min-w-0 flex-1', children: [
         jsx('span', { className: 'block text-[10px] text-(--ui-text-quaternary)', children: pr.source === 'transcript' ? 'Linked in this session' : 'This session’s branch' }),
         jsx('span', { className: 'block text-xs font-medium break-words', children: `#${pr.number} ${pr.title || ''}` }),
       ] }),
-      jsx(Badge, { variant: 'secondary', className: 'text-[10px] h-4 shrink-0', children: String(pr.state || '').toLowerCase() }),
+      jsx(Badge, { variant: 'muted', className: 'ml-auto', children: String(pr.state || '').toLowerCase() }),
     ],
   })
 }
@@ -3508,7 +3600,7 @@ function useListKeyboardFlow(query) {
   return { searchRef, onKeyDown }
 }
 
-function GitHubPane() {
+function RepositoryPane() {
   const { reposQ, repo, repoOptions, tab, query, selPr, selIssue } = useGitHubShellState()
   const paneVisible = useValue(typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID) : $alwaysVisible)
   const keyboard = useListKeyboardFlow(query)
@@ -3537,7 +3629,7 @@ function GitHubPane() {
               reposQ.isLoading
                 ? jsx(Skeleton, { className: 'h-8 flex-1 rounded-md' })
                 : jsx('div', { className: 'min-w-0 flex-1', children: jsx(RepoPicker, { repos: repoOptions, value: repo, onChange: v => $repo.set(v) }) }),
-              jsx(Button, { variant: 'ghost', size: 'sm', className: 'h-7 w-7 p-0 ml-auto', onClick: () => queryClient.invalidateQueries({ queryKey: [ID] }), 'aria-label': 'Refresh GitHub data', children: jsx(icons.RefreshCw, { className: 'size-3' }) }),
+              jsx(Button, { variant: 'ghost', size: 'icon-xs', className: 'ml-auto', onClick: () => queryClient.invalidateQueries({ queryKey: [ID] }), 'aria-label': 'Refresh GitHub data', children: jsx(icons.RefreshCw, { className: 'size-3' }) }),
             ],
           }),
           jsx(Separator, { className: 'my-3' }),
@@ -3574,7 +3666,7 @@ function GitHubPane() {
   })
 }
 
-function GithubPage() {
+function RepositoryPage() {
   const { reposQ, repo, repoOptions, tab, query, selPr, selIssue } = useGitHubShellState()
   const keyboard = useListKeyboardFlow(query)
 
@@ -3592,7 +3684,7 @@ function GithubPage() {
     onKeyDown: keyboard.onKeyDown,
     children: [
       jsxs('div', {
-        className: 'shrink-0 border-b border-(--ui-stroke-secondary) bg-(--ui-editor-surface-background)',
+        className: 'shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background)',
         children: [
           jsx(SessionPrBanner, {}),
           jsxs('div', {
@@ -3603,8 +3695,8 @@ function GithubPage() {
                 children: [
                   jsxs('span', { className: 'flex items-center gap-2 text-sm font-semibold', children: [jsx(Codicon, { name: 'github' }), 'GitHub'] }),
                   jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: repo || '—' }),
-                  jsx(Button, { variant: 'ghost', size: 'sm', className: 'ml-auto h-7 w-7 p-0', onClick: () => queryClient.invalidateQueries({ queryKey: [ID] }), 'aria-label': 'Refresh', children: jsx(icons.RefreshCw, { className: 'size-3' }) }),
-                  jsx(Button, { variant: 'ghost', size: 'sm', className: 'h-7 px-2 text-xs', onClick: openGithubPane, children: 'Open pane' }),
+                  jsx(Button, { variant: 'ghost', size: 'icon-xs', className: 'ml-auto', onClick: () => queryClient.invalidateQueries({ queryKey: [ID] }), 'aria-label': 'Refresh', children: jsx(icons.RefreshCw, { className: 'size-3' }) }),
+                  jsx(Button, { variant: 'ghost', size: 'sm', onClick: openGithubPane, children: 'Open pane' }),
                 ],
               }),
               reposQ.isLoading
@@ -3645,13 +3737,247 @@ function GithubPage() {
   })
 }
 
+export function classifyInboxPull(pr) {
+  if (pr.state !== 'OPEN') return []
+  const buckets = (pr.sources || []).filter(s => s === 'direct' || s === 'team')
+  const owned = pr.sources?.some(s => s === 'authored' || s === 'assigned')
+  if (!owned) return buckets
+  if (pr.isDraft) return pr.sources.includes('authored') ? [...buckets, 'drafts'] : buckets
+  const commit = pr.commits?.nodes?.[0]?.commit
+  const checks = commit?.statusCheckRollup?.state
+  if (pr.reviewDecision === 'CHANGES_REQUESTED' || pr.mergeable === 'CONFLICTING' || ['FAILURE', 'ERROR'].includes(checks)) return [...buckets, 'action']
+  // CLEAN is GitHub's positive aggregate merge-state verdict (required checks included).
+  // Never infer readiness from an absent/conflicting/unknown merge verdict.
+  if (pr.isDraft === false && pr.mergeable === 'MERGEABLE' && pr.mergeStateStatus === 'CLEAN' &&
+      (pr.reviewDecision === 'APPROVED' || pr.reviewDecision === null) && commit &&
+      (checks === 'SUCCESS' || commit.statusCheckRollup === null)) return [...buckets, 'ready']
+  if (pr.reviewDecision === 'REVIEW_REQUIRED' || pr.reviewRequests?.nodes?.length) return [...buckets, 'waiting']
+  return buckets
+}
+
+const INBOX_PAGE_SIZE = 50
+const INBOX_PAGE_CAP = 3
+export const INBOX_SECTIONS = [
+  ['direct', 'Needs your review'], ['team', 'Needs your teams review'],
+  ['action', 'Needs action'], ['ready', 'Ready to merge'],
+  ['drafts', 'Your drafts'], ['waiting', 'Waiting for review'],
+]
+const INBOX_VIEWS = [['inbox', 'Inbox'], ['authored', 'Authored by me'], ['assigned', 'Assigned to me'], ['involves', 'Involves me'], ['reviews', 'Review requested']]
+const INBOX_SEARCHES = { authored: 'author:@me', assigned: 'assignee:@me', involves: 'involves:@me', direct: 'user-review-requested:@me', team: 'team-review-requested-user:@me' }
+
+export function inboxFilters(input = {}) {
+  const repos = Array.isArray(input.repositories) ? input.repositories : String(input.repositories || '').split(/[\s,]+/)
+  const repositories = [...new Set(repos.map(r => String(r).trim().toLowerCase()).filter(Boolean))].sort()
+  if (repositories.length > 5) throw new Error('Maximum five repositories')
+  if (repositories.some(r => !/^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/.test(r) || ['.', '..'].includes(r.split('/')[1]))) throw new Error('Invalid owner/repository')
+  const organization = String(input.organization || '').trim().toLowerCase()
+  if (organization && !/^[a-z0-9][a-z0-9-]*$/.test(organization)) throw new Error('Invalid organization')
+  return { view: INBOX_VIEWS.some(([v]) => v === input.view) ? input.view : 'inbox', repositories, organization, updated: ['1', '7', '30', '90'].includes(String(input.updated)) ? String(input.updated) : 'all' }
+}
+export function inboxQueryKey(filters, identity = '') {
+  const f = inboxFilters(filters)
+  return ['githermes', 'inbox', identity, f.view, f.updated, f.organization, f.repositories.join(',')]
+}
+export function inboxMatchesRepository(repo, filters) {
+  const r = String(repo || '').toLowerCase()
+  return (!filters.repositories.length || filters.repositories.includes(r)) && (!filters.organization || r.split('/')[0] === filters.organization)
+}
+export function inboxSearch(filters, source, now = new Date()) {
+  const f = inboxFilters(filters)
+  if (!INBOX_SEARCHES[source]) throw new Error('Invalid PR view')
+  const repos = f.repositories.filter(r => !f.organization || r.split('/')[0] === f.organization)
+  if (f.repositories.length && !repos.length) return null
+  const updated = f.updated === 'all' ? [] : [`updated:>=${new Date(now.getTime() - Number(f.updated) * 86400000).toISOString()}`]
+  return ['is:pr', 'is:open', INBOX_SEARCHES[source], ...repos.map(r => `repo:${r}`), ...(!repos.length && f.organization ? [`org:${f.organization}`] : []), ...updated, 'sort:updated-desc'].join(' ')
+}
+export function inboxItemUrl(item) {
+  const url = item.url || item.html_url || ''
+  return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(url) ? url : ''
+}
+export function inboxDraft(item) {
+  const url = inboxItemUrl(item)
+  return url ? `Help me review this pull request: ${url}\nInspect the changes and suggest next steps. Do not submit a review or change GitHub state without my confirmation.` : ''
+}
+export function inboxCountLabel(result) {
+  return result ? [`${result.items.length} loaded`, ...(result.statuses || [])].join(' · ') : ''
+}
+
+// Structured read-only request seam; an account-aware backend can inject this transport.
+export const INBOX_GRAPHQL = `query GitHermesInbox($search: String!, $cursor: String) {
+  search(query: $search, type: ISSUE, first: ${INBOX_PAGE_SIZE}, after: $cursor) {
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      id number title url state isDraft updatedAt mergeable mergeStateStatus reviewDecision
+      repository { nameWithOwner } author { login }
+      reviewRequests(first: 100) { pageInfo { hasNextPage } nodes { requestedReviewer {
+        __typename ... on User { login } ... on Team { slug organization { login } }
+      } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    } }
+  }
+}`
+export async function readInboxRequest(request, guard) {
+  if (request.kind !== 'graphql' || request.query !== INBOX_GRAPHQL) throw new Error('Unsupported PR request')
+  guard?.()
+  const result = await githubOperation({ operation: 'github.api', path: 'graphql', method: 'POST', body: { query: request.query, variables: request.variables } })
+  guard?.()
+  return result
+}
+export async function loadGitHubInbox(input, read = readInboxRequest, now = new Date()) {
+  const f = inboxFilters(input), items = new Map(), statuses = new Set()
+  const sources = f.view === 'inbox' ? ['direct', 'team', 'authored', 'assigned'] : f.view === 'reviews' ? ['direct', 'team'] : [f.view]
+  let partial = false
+  for (const source of sources) {
+    const search = inboxSearch(f, source, now)
+    if (search === null) continue
+    let cursor = null
+    try {
+      for (let page = 0; page < INBOX_PAGE_CAP; page++) {
+        const response = await read({ kind: 'graphql', query: INBOX_GRAPHQL, variables: { search, cursor } })
+        if (response?.errors?.length) throw new Error('GitHub PR query failed')
+        const data = response?.data?.search
+        if (!data || !Array.isArray(data.nodes) || !Number.isInteger(data.issueCount) || typeof data.pageInfo?.hasNextPage !== 'boolean') throw new Error('Invalid GitHub PR response')
+        for (const pr of data.nodes) {
+          if (!pr?.id || !pr.repository?.nameWithOwner || !inboxItemUrl(pr) || !['OPEN', 'CLOSED', 'MERGED'].includes(pr.state)) throw new Error('Invalid GitHub PR node')
+          if (!inboxMatchesRepository(pr.repository.nameWithOwner, f) || pr.state !== 'OPEN') continue
+          const previous = items.get(pr.id)
+          items.set(pr.id, { ...pr, repo: pr.repository.nameWithOwner, sources: [...new Set([...(previous?.sources || []), source])] })
+          if (pr.reviewRequests?.pageInfo?.hasNextPage) { partial = true; statuses.add('Review requests truncated') }
+        }
+        if (!data.pageInfo.hasNextPage) break
+        if (!data.pageInfo.endCursor || data.pageInfo.endCursor === cursor || page === INBOX_PAGE_CAP - 1) { partial = true; break }
+        cursor = data.pageInfo.endCursor
+      }
+    } catch (error) {
+      // Supported team search avoids guessing membership from mentions/notifications.
+      // Denied/unsupported search cannot be represented as an empty complete team queue.
+      if (source !== 'team' || error.code === 'INBOX_CONTEXT_CHANGED' || error.name === 'AbortError') throw error
+      partial = true; statuses.add('Team reviews unavailable')
+    }
+  }
+  const rows = [...items.values()].sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))).map(pr => ({ ...pr, buckets: classifyInboxPull(pr) }))
+  if (partial) statuses.add('Partial results')
+  if (f.view === 'inbox' && rows.some(pr => !pr.buckets.length)) statuses.add('Unclassified PRs')
+  return { kind: 'pulls', items: rows, partial, statuses: [...statuses] }
+}
+export function inboxIdentity(api = host) {
+  return JSON.stringify([api.state.connectionId.get(), api.state.profile.get(), githubAccountState.get().login, githubAccountState.get().generation])
+}
+export function assertInboxContext(identity, api = host) {
+  if (api.state.gateway.get() !== 'open' || inboxIdentity(api) !== identity) {
+    const error = new Error('GitHub context changed or disconnected')
+    error.code = 'INBOX_CONTEXT_CHANGED'
+    throw error
+  }
+}
+export function inboxQueryOptions(filters, identity, active, gateway, read = readInboxRequest) {
+  return {
+    queryKey: inboxQueryKey(filters, identity),
+    queryFn: () => loadGitHubInbox(filters, async request => {
+      const guard = () => assertInboxContext(identity)
+      guard(); const result = await read(request, guard); guard(); return result
+    }),
+    enabled: active && gateway === 'open', staleTime: 60_000,
+    refetchInterval: query => active && gateway === 'open' && query.state.status !== 'error' ? 60_000 : false,
+    refetchIntervalInBackground: false, refetchOnWindowFocus: true, retry: false,
+  }
+}
+
+export function GitHubInbox({ active = true, read = readInboxRequest } = {}) {
+  const gateway = useValue(host.state.gateway)
+  const connectionId = useValue(host.state.connectionId)
+  const profile = useValue(host.state.profile)
+  const sessionId = useValue(host.state.activeSessionId)
+  const [filters, setFilters] = useState(() => inboxFilters())
+  const [repos, setRepos] = useState(''), [org, setOrg] = useState('')
+  const [filterError, setFilterError] = useState('')
+  const account = useValue(githubAccountState)
+  const identity = JSON.stringify([connectionId, profile, account.login, account.generation])
+  const query = useQuery(inboxQueryOptions(filters, identity, active, gateway, read))
+  const change = patch => setFilters(old => inboxFilters({ ...old, ...patch }))
+  const rows = query.data?.items || []
+  const row = item => {
+    const url = inboxItemUrl(item)
+    return jsxs('article', { className: 'flex flex-col gap-1 border-b border-(--ui-stroke-tertiary) py-2', children: [
+      jsx('strong', { className: 'text-sm break-words', children: item.title }),
+      jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: `${item.repo || item.repository?.nameWithOwner} #${item.number} · ${item.isDraft ? 'Draft' : item.reviewDecision === 'CHANGES_REQUESTED' ? 'Changes requested' : item.mergeStateStatus || 'Status unknown'}` }),
+      jsxs('div', { className: 'flex flex-wrap items-center gap-1', children: [
+        jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url, onClick: () => openExternal(url), children: 'Open GitHub' }),
+        url ? jsx(CopyButton, { text: url, label: 'Copy link', appearance: 'button', buttonSize: 'xs' }) : null,
+        jsx(Button, { variant: 'ghost', size: 'xs', disabled: !url || !sessionId, onClick: () => { if (host.state.activeSessionId.get()) insertComposerText(inboxDraft(item)) }, children: 'Ask Hermes · draft' }),
+      ] }),
+    ] }, item.id)
+  }
+  return jsxs('section', { 'aria-label': 'Pull request inbox', className: 'flex h-full min-h-0 flex-col gap-3 p-3 text-(--ui-text-primary)', children: [
+    jsxs('header', { className: 'flex flex-wrap items-center gap-2', children: [
+      jsx('strong', { children: 'Pull request inbox' }),
+      jsx(Button, { variant: 'ghost', size: 'xs', disabled: !active || gateway !== 'open' || query.isFetching, onClick: () => { assertInboxContext(identity); if (active) query.refetch() }, children: query.isFetching ? 'Refreshing…' : 'Refresh' }),
+      jsx(Button, { variant: 'ghost', size: 'xs', onClick: () => openExternal('https://github.com/pulls/inbox'), children: 'Open inbox on GitHub' }),
+    ] }),
+    jsx(SegmentedControl, { value: filters.view, onChange: view => change({ view }), options: INBOX_VIEWS.map(([id, label]) => ({ id, label })) }),
+    jsxs('form', { className: 'flex flex-col gap-2', onSubmit: e => { e.preventDefault(); try { change({ repositories: repos, organization: org }); setFilterError('') } catch (error) { setFilterError(error.message) } }, children: [
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Repositories', jsx(Input, { 'aria-label': 'Repositories', placeholder: 'owner/repo, owner/another', value: repos, onChange: e => setRepos(e.target.value) })] }),
+      jsxs('label', { className: 'flex flex-col gap-1 text-xs', children: ['Organization', jsx(Input, { 'aria-label': 'Organization', value: org, onChange: e => setOrg(e.target.value) })] }),
+      jsx(Select, { value: filters.updated, onValueChange: updated => change({ updated }), children: [jsx(SelectTrigger, { 'aria-label': 'Updated', children: jsx(SelectValue, {}) }), jsx(SelectContent, { children: [['all', 'Any update'], ['1', 'Updated in 24 hours'], ['7', 'Updated in 7 days'], ['30', 'Updated in 30 days'], ['90', 'Updated in 90 days']].map(([value, label]) => jsx(SelectItem, { value, children: label }, value)) })] }),
+      jsx(Button, { type: 'submit', variant: 'secondary', size: 'sm', children: 'Apply filters' }),
+    ] }),
+    jsx('span', { role: 'status', className: 'text-xs text-(--ui-text-secondary)', children: gateway !== 'open' ? 'Disconnected' : query.isPending ? 'Loading…' : inboxCountLabel(query.data) }),
+    filterError || query.error ? jsx('span', { role: 'alert', className: 'text-xs', children: filterError || query.error.message }) : null,
+    jsx(ScrollArea, { className: 'flex-1 min-h-0', children: filters.view === 'inbox'
+      ? jsxs('div', { children: [
+          ...INBOX_SECTIONS.map(([id, label]) => {
+            const matches = rows.filter(pr => pr.buckets.includes(id))
+            return jsxs('details', { open: true, className: 'border-b border-(--ui-stroke-tertiary) py-2', children: [
+              jsx('summary', { className: 'cursor-pointer text-sm font-medium', children: `${label} · ${matches.length}` }),
+              ...matches.map(row),
+            ] }, id)
+          }),
+          ...rows.filter(pr => !pr.buckets.length).map(row),
+        ] })
+      : jsx('div', { children: rows.length ? rows.map(row) : jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: query.data?.partial ? 'No matches · Partial results' : 'No matching pull requests' }) }),
+    }),
+  ] })
+}
+
+export function setGitHubMode(mode) {
+  const value = mode === 'inbox' ? 'inbox' : 'repository'
+  githubShellStore.mode.set(value)
+  pluginCtx?.storage.set('mode', value)
+}
+
+export function GitHubSurface({ page = false } = {}) {
+  const mode = useValue(githubShellStore.mode)
+  const visible = useValue(typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID) : $alwaysVisible)
+  const connection = useValue(host.state.connectionId)
+  const profile = useValue(host.state.profile)
+  const gateway = useValue(host.state.gateway)
+  const account = useValue(githubAccountState)
+  useEffect(() => { if (gateway === 'open') refreshGitHubAccounts().catch(() => {}) }, [connection, profile, gateway])
+  const ready = account.ready && account.context === githubContext() && gateway === 'open'
+  return jsxs('div', { className: 'flex h-full min-h-0 flex-col', children: [
+    jsxs('div', { className: 'flex flex-wrap gap-2 shrink-0 p-2 border-b border-(--ui-stroke-tertiary)', children: [
+      jsx(SegmentedControl, { value: mode, onChange: setGitHubMode, options: [{ id: 'repository', label: 'Repository' }, { id: 'inbox', label: 'Inbox' }] }),
+      jsx(GitHubAccountSelector, {}),
+      jsx(Button, { variant: 'ghost', size: 'xs', disabled: account.pending || gateway !== 'open', onClick: () => refreshGitHubAccounts(true).catch(() => {}), children: 'Refresh accounts' }),
+    ] }),
+    ready ? jsx('div', { className: 'flex-1 min-h-0', children: mode === 'inbox'
+      ? jsx(GitHubInbox, { active: page || visible })
+      : jsx(page ? RepositoryPage : RepositoryPane, {}) }, JSON.stringify([connection, profile, account.login, account.generation]))
+      : jsx('div', { role: account.error ? 'alert' : 'status', className: 'p-3 text-xs', children: gateway !== 'open' ? 'Disconnected' : account.error || 'Loading accounts…' }),
+  ] })
+}
+function GitHubPane() { return jsx(GitHubSurface, {}) }
+function GithubPage() { return jsx(GitHubSurface, { page: true }) }
+
 export default {
   id: ID,
   name: 'GitHermes',
   register(ctx) {
     pluginCtx = ctx
+    bindGitHubAccountLifetime(ctx)
     // Start the shared probe; shellCommand awaits it before any command runs.
     resolveBash()
+    githubShellStore.mode.set(ctx.storage.get('mode') === 'inbox' ? 'inbox' : 'repository')
     const saved = ctx.storage.get('repo')
     if (saved) $repo.set(saved)
     const assignments = ctx.storage.get('botAssignments', {})
@@ -3672,8 +3998,10 @@ export default {
       area: PANES_AREA,
       title: 'GitHub',
       data: {
-        placement: 'main',
-        dock: { pane: 'workspace', pos: 'right' },
+        // Default to native Files tabs; never enforce over a saved layout.
+        placement: 'right',
+        dock: { pane: 'files', pos: 'center' },
+        closeBehavior: 'hide',
         width: '440px',
         revealAliases: [PANE_ID, 'github'],
       },

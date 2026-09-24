@@ -1,6 +1,6 @@
 name: githermes
-version: "0.5.0"
-description: GitHub PRs & Issues as a right workspace pane in Hermes Desktop. Data via the connected gh CLI — no backend, no tokens.
+version: "0.6.0"
+description: GitHub PRs & Issues with private profile-scoped GitHub account execution.
 manifest_version: 1
 requires_hermes: ">=0.21.1"
 author: claudioorjunior
