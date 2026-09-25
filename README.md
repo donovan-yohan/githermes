@@ -52,6 +52,10 @@ hermes plugins enable githermes
 
 First install this checkout as a trusted unified user package in the backend's plugin directory, with both `desktop/` and `dashboard/`. The account integration is not yet published upstream. Enable it with the command above, then reload the backend to mount its Python routes. **Copying only `desktop/plugin.js` is no longer sufficient.** Follow the [installation requirements](docs/account-execution-feasibility.md#installation-requirements-not-performed-by-this-change); account switching requires no plugin-specific host routing patch.
 
+### Headless Desktop backend
+
+GitHermes works with Desktop's `hermes serve` backend; no browser dashboard is required. A headless “web UI disabled” 404 means the request missed the registered API, not that a browser UI is needed. See [backend discovery, profile scope, and compatibility](docs/headless-backend.md).
+
 ### Upgrading from `github-prs`
 
 The plugin **id** changed (`github-prs` → `githermes`), so the old install must be removed first — delete the old folder (`~/.hermes/desktop-plugins/github-prs/` or `~/.hermes/plugins/github-prs/`), then install fresh. One-time cost: the saved repository in the picker resets (plugin storage is namespaced by id).
