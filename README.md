@@ -34,7 +34,7 @@ A desktop plugin (`@hermes/plugin-sdk`) that shows your repository's PRs and iss
 
 ## Requirements
 
-> **Desktop compatibility:** Keeping GitHub navigation after closing its pane requires the companion host patch implementing `closeBehavior: 'hide'`. Older desktops may disable the plugin on Close; installing this plugin alone does not fix that host behavior. See [native desktop integration](docs/native-desktop-integration.md).
+> **Desktop compatibility:** This branch uses a plugin-only pane disposer and an in-pane **Close** button to retain GitHub navigation on stock Desktop. It does not require fork host patches; native tab X is deliberately unavailable because stock Close disables sole-pane plugins. See [compatibility evidence and tradeoffs](docs/stock-2271-compatibility.md).
 
 Repository / Inbox mode is shared between pane and page. Inbox is the [GitHub pull request inbox](https://github.com/pulls/inbox): six collapsible sections, authored/assigned/involves/review views, multi-repository/organization/update filters, copy links and draft handoff. Personal and team review requests use separate documented search qualifiers. See [classification rules and parity gaps](docs/pr-inbox.md).
 

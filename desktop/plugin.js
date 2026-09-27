@@ -350,15 +350,43 @@ function DiffCount({ add, del, className }) {
   ] })
 }
 
-function openGithubPane() {
-  if (typeof host.revealPane === 'function') {
-    host.revealPane(PANE_ID)
-    return
+let githubPaneLifecycle = null
+
+// Stock Desktop exposes a registration disposer, not a side-pane close action.
+// Keep navigation registered; remove only our genuine pane contribution.
+export function createGithubPaneLifecycle(ctx, contribution, api = host) {
+  let disposePane = null
+  let disposed = false
+  const register = () => {
+    if (!disposed && !disposePane) disposePane = ctx.register(contribution)
   }
-  // Legacy reveal path; older desktops still need the host close-policy update.
-  try {
-    window.dispatchEvent(new CustomEvent(REVEAL, { detail: { id: PANE_ID, mode: 'open' } }))
-  } catch { /* older shells ignore */ }
+  const close = () => {
+    if (disposed) return
+    disposePane?.()
+    disposePane = null
+    ctx.storage.set?.('paneHidden', true)
+  }
+  const open = () => {
+    if (disposed) return
+    register()
+    ctx.storage.set?.('paneHidden', false)
+    if (typeof api.revealPane === 'function') api.revealPane(PANE_ID)
+    else {
+      try { window.dispatchEvent(new CustomEvent(REVEAL, { detail: { id: PANE_ID, mode: 'open' } })) } catch { /* legacy overlay */ }
+    }
+  }
+  const toggle = () => {
+    // Registration alone is not visibility: Files may hold the active tab.
+    if (disposePane && api.paneVisibility?.(PANE_ID)?.get() !== false) close()
+    else open()
+  }
+  ctx.onDispose?.(() => { disposed = true; disposePane?.(); disposePane = null })
+  if (!ctx.storage.get('paneHidden', false)) register()
+  return { open, close, toggle }
+}
+
+function openGithubPane() {
+  githubPaneLifecycle?.open()
 }
 
 function openGithubPage() {
@@ -1387,10 +1415,7 @@ function TitlebarGithubButton() {
     variant: 'ghost',
     size: 'sm',
     'aria-label': 'GitHub',
-    onClick: () => {
-      if (typeof host.togglePane === 'function') host.togglePane(PANE_ID)
-      else openGithubPane()
-    },
+    onClick: () => githubPaneLifecycle?.toggle(),
     children: jsxs('span', {
       className: 'flex items-center gap-1.5',
       children: [
@@ -3983,17 +4008,20 @@ export default {
     const assignments = ctx.storage.get('botAssignments', {})
     if (assignments && typeof assignments === 'object' && !Array.isArray(assignments)) $botAssignments.set(assignments)
 
-    const paneWrap = () => jsxs('div', { className: 'githermes-pane h-full min-h-0 min-w-0 max-w-full overflow-hidden', children: [
+    const paneWrap = () => jsxs('div', { className: 'githermes-pane h-full min-h-0 min-w-0 max-w-full overflow-hidden flex flex-col', children: [
       jsx('style', { children: PANE_WRAP_CSS }),
+      jsx('div', { className: 'flex shrink-0 justify-end px-2 py-1', children:
+        jsx(Button, { variant: 'ghost', size: 'xs', 'aria-label': 'Close GitHub pane', onClick: () => githubPaneLifecycle?.close(), children: 'Close' }),
+      }),
       jsxs('div', { className: 'gh-narrow-only h-full flex-col items-center justify-center gap-2 px-2 text-center text-(--ui-text-quaternary)', children: [
         jsx(Codicon, { name: 'github', className: 'text-base' }),
         jsx('span', { className: 'text-[10px] leading-4', children: 'Widen pane' }),
       ] }),
-      jsx('div', { className: 'gh-pane-content h-full min-h-0', children: jsx(GitHubPane, {}) }),
+      jsx('div', { className: 'gh-pane-content flex-1 min-h-0', children: jsx(GitHubPane, {}) }),
     ] })
     const pageShell = () => jsxs('div', { className: 'githermes-pane h-full min-h-0 min-w-0 max-w-full overflow-hidden bg-(--ui-editor-surface-background)', children: [jsx('style', { children: PANE_WRAP_CSS }), jsx(GithubPage, {})] })
 
-    ctx.register({
+    githubPaneLifecycle = createGithubPaneLifecycle(ctx, {
       id: 'pane',
       area: PANES_AREA,
       title: 'GitHub',
@@ -4001,7 +4029,9 @@ export default {
         // Default to native Files tabs; never enforce over a saved layout.
         placement: 'right',
         dock: { pane: 'files', pos: 'center' },
-        closeBehavior: 'hide',
+        // Stock native tab Close disables a sole-pane plugin. Keep that
+        // destructive action unavailable; our Close uses the pane disposer.
+        uncloseable: true,
         width: '440px',
         revealAliases: [PANE_ID, 'github'],
       },

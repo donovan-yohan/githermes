@@ -12,13 +12,14 @@ function contributions() {
   return entries
 }
 
-test('GitHub uses the native right tab group and opts into hide without disabling', () => {
+test('GitHub uses native Files tabs and blocks stock destructive Close', () => {
   const entries = contributions()
   const pane = entries.find(entry => entry.area === 'panes')
   assert.equal(pane.title, 'GitHub')
   assert.equal(pane.data.placement, 'right')
   assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center' })
-  assert.equal(pane.data.closeBehavior, 'hide')
+  assert.equal(pane.data.uncloseable, true)
+  assert.equal(pane.data.closeBehavior, undefined)
   assert.ok(pane.data.revealAliases.includes('github'))
 })
 
@@ -54,19 +55,20 @@ test('reopening prefers the public SDK reveal action', () => {
   }
 })
 
-test('titlebar toggles through the host independently of explicit Open', () => {
+test('titlebar does not depend on fork-only host.togglePane', () => {
   const entry = contributions().find(entry => entry.id === 'titlebar-github')
   const component = entry.render()
   const button = component.type(component.props)
-  const toggles = []
-  const oldToggle = host.togglePane
-  host.togglePane = id => toggles.push(id)
+  const reveals = []
+  const oldReveal = host.revealPane
+  host.revealPane = id => reveals.push(id)
   try {
     assert.equal(button.props['aria-label'], 'GitHub')
-    button.props.onClick()
-    button.props.onClick()
-    assert.deepEqual(toggles, ['githermes:pane', 'githermes:pane'])
-  } finally { host.togglePane = oldToggle }
+    button.props.onClick() // Close via registration disposer.
+    assert.deepEqual(reveals, [])
+    button.props.onClick() // Re-register + explicit reveal.
+    assert.deepEqual(reveals, ['githermes:pane'])
+  } finally { host.revealPane = oldReveal }
 })
 
 test('legacy reopening requests open rather than toggle or plugin enable', () => {
