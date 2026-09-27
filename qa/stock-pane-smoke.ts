@@ -132,6 +132,7 @@ test('public SDK pane lifecycle without disabling GitHermes', async () => {
     await expect(nav).toBeVisible()
     expect(await decisions()).toBe(enabledBefore)
     await checkpoint('collapsed-second-press-reopens')
+    expect(errors).toEqual([])
     fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ upstream: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(), platform: process.platform, checkpoints }, null, 2))
   } finally {
     if (page) {

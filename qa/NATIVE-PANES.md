@@ -27,6 +27,8 @@ npx --yes npm@11.17.0 ci --no-audit --no-fund
 uv sync --python 3.14
 npm run build --workspace apps/desktop
 export GITHERMES_SOURCE=/absolute/path/to/githermes-worktree
+mkdir -p "$HOME/.cache/githermes-qa"
+export TMPDIR="$(mktemp -d "$HOME/.cache/githermes-qa/run.XXXXXX")"
 cp "$GITHERMES_SOURCE/qa/upstream-pane.vitest.ts" upstream-pane.test.ts
 node node_modules/vitest/vitest.mjs run --config "$GITHERMES_SOURCE/qa/upstream-pane.config.mjs"
 cp "$GITHERMES_SOURCE/qa/stock-pane-smoke.ts" apps/desktop/
