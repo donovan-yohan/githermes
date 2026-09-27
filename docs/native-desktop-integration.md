@@ -4,13 +4,13 @@
 
 GitHub remains a permanent sidebar navigation entry while the plugin is enabled. The navigation entry opens the `/github` workspace page. The GitHub tool pane belongs to the native right-hand tab group, rather than creating a second split beside the workspace. The command palette provides separate page and pane actions.
 
-The pane declares `closeBehavior: 'hide'`. Closing it should dismiss that pane only, keeping the GitHub route, navigation entry, and commands registered. Reopening uses `host.revealPane('githermes:pane')`; older hosts retain the legacy reveal-event fallback. Explicitly disabling the plugin in Capabilities still unloads its contributions.
+The titlebar and the pane's own **Close** button remove only the pane contribution through the public `ctx.register` disposer. Reopening re-registers the same pane ID and calls `host.revealPane('githermes:pane')`. Navigation, page and commands stay registered, and the user's closed choice persists in plugin storage.
 
-### Required host change
+### Stock-host compatibility
 
-The hide-on-close policy requires Hermes Desktop support for `PaneData.closeBehavior`. The companion implementation is commit `962febc2eb87ce239b38d8e55078115c76434da0` on local branch `feat/desktop-pane-close-hide`.
+Both freshly fetched upstream main and the matched official `0.21.5+2271` source lack `host.togglePane` and `closeBehavior: 'hide'`; native Close disables a single-pane plugin. This branch therefore marks the pane `uncloseable:true` and supplies its own Close action. Native tab X/middle-click/bulk-close are unavailable for GitHub, and the native group minimize affordance is suppressed while it contains this pane. External side collapse also remains a visibility-atom limitation: an active pane behind a collapsed side needs two titlebar presses, or one explicit palette Open. No host patch is required for this alternative. See [exact provenance, tests and remaining limitations](stock-2271-compatibility.md).
 
-Older Desktop builds ignore this field and may still disable a single-pane plugin when its tab closes. The presence of `host.revealPane` alone does not establish support. Updating the plugin without updating the host is not a complete fix.
+Fork changes are not evidence of a shipped official Windows feature. This branch has not been verified on Windows or installed into the user's app.
 
 Existing user-customized layouts remain authoritative. Changing the default placement does not forcibly move an already-positioned tab. Drag GitHub into the right tab group or use an explicit layout reset when migrating an older layout; do not reset the user's entire layout automatically.
 
@@ -26,4 +26,4 @@ See [PR inbox](pr-inbox.md) for official sources, exact public-API classificatio
 
 ## Verification boundaries
 
-Node tests exercise plugin contribution declarations, navigation actions, pure logic, and component contracts using test-only SDK stubs. They do not establish rendered parity or installed Electron behavior. The companion host tests exercise the actual tree store and contribution registry. Release verification must additionally exercise an actual Desktop renderer: close/reopen, retained sidebar navigation, tab grouping, layout persistence, narrow widths, and light/dark appearance.
+Node tests exercise plugin contribution declarations, navigation actions, pure logic, and component contracts using test-only SDK stubs. Real SDK/native renderer tests and isolated Linux Electron smoke now pass on both official source revisions: close/reopen, retained sidebar navigation, unchanged plugin decisions, Files grouping and closed-state reload. No fork dependency or host source modification was used. See the linked compatibility report for source SHAs, evidence and remaining Windows, custom-placement and appearance coverage limits.

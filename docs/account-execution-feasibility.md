@@ -124,8 +124,10 @@ sanitizer bypass or permission broadening is used.
    Normal backend/plugin loading is needed to mount new Python routes; no
    GitHermes-specific core patch, rebuild or route allowlist is required.
 
-Pane-close persistence is a separate generic `closeBehavior: 'hide'` host feature
-covered in native-desktop-integration.md, not an account-routing dependency.
+Pane-close behavior is separate from account routing. This branch uses the
+plugin-only registration-disposer alternative documented in
+native-desktop-integration.md; stock SDK limitations and provenance are in
+stock-2271-compatibility.md.
 
 ## Verification
 

@@ -1,0 +1,174 @@
+{
+  "pluginSha256": "115eec933e390719136d436ec6067fe5abd428d52cfe920d65b45a5aa9a8213a",
+  "node": {
+    "tests": 136,
+    "pass": 136,
+    "fail": 0,
+    "skipped": 0
+  },
+  "officialRuns": [
+    {
+      "host": "latest",
+      "upstream": "ca16be564d0a95f86bd6da44bb41d39cde9db089",
+      "platform": "linux",
+      "checkpoints": [
+        {
+          "name": "opened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "reopened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed-again",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "close-control",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "icon-reopened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "files-group",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed-after-reload",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "reopened-after-reload",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "collapsed-first-press-limitation",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "collapsed-second-press-reopens",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        }
+      ],
+      "nativeSdkTests": 2,
+      "nativeSdkPassed": 2,
+      "electronLog": "Running 1 test using 1 worker\n\n\n  \u2713  1 stock-pane-smoke.ts:9:1 \u203a public SDK pane lifecycle without disabling GitHermes (12.6s)\n\n  1 passed (13.2s)",
+      "pageErrors": [],
+      "evidenceDirectory": "/home/donovanyohan/.hermes/profiles/ebi/cache/scratch/githermes-official-latest/stock-pane-evidence"
+    },
+    {
+      "host": "stock",
+      "upstream": "ec243785e41e7a12d47b099d9f747c781687f57a",
+      "platform": "linux",
+      "checkpoints": [
+        {
+          "name": "opened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "reopened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed-again",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "close-control",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "icon-reopened",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "files-group",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "closed-after-reload",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "reopened-after-reload",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        },
+        {
+          "name": "collapsed-first-press-limitation",
+          "closeVisible": false,
+          "hidden": "true",
+          "decisions": null
+        },
+        {
+          "name": "collapsed-second-press-reopens",
+          "closeVisible": true,
+          "hidden": "false",
+          "decisions": null
+        }
+      ],
+      "nativeSdkTests": 2,
+      "nativeSdkPassed": 2,
+      "electronLog": "Running 1 test using 1 worker\n\n\n  \u2713  1 stock-pane-smoke.ts:9:1 \u203a public SDK pane lifecycle without disabling GitHermes (13.6s)\n\n  1 passed (14.1s)",
+      "pageErrors": [],
+      "evidenceDirectory": "/home/donovanyohan/.hermes/profiles/ebi/cache/scratch/githermes-official-stock/stock-pane-evidence"
+    }
+  ],
+  "boundaries": [
+    "Unmodified official source and lockfiles; isolated dependency installations.",
+    "Linux source-build Electron, not a packaged Windows executable.",
+    "No account backend installed in test homes; missing-plugin account status is expected.",
+    "Collapsed-side two-press behavior is a characterized limitation, not a native-toggle pass.",
+    "No publication, merge or live-profile plugin installation."
+  ]
+}
