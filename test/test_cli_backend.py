@@ -45,8 +45,7 @@ def backend(tmp_path, mode='serve', enabled=True, packaged=True, profile_launch=
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     gh = bin_dir / 'gh'
-    gh.write_text('''#!/usr/bin/python3
-import json, os, sys
+    gh.write_text('#!' + sys.executable + '\n' + '''import json, os, sys
 args = sys.argv[1:]
 config = os.environ['GH_CONFIG_DIR']
 with open(config + '/audit.jsonl', 'a') as f:
