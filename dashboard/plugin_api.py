@@ -24,7 +24,13 @@ authority = sibling('authority')
 
 
 def scope(profile):
-    from hermes_cli.web_server_profiles import _config_profile_scope
+    # Host branches differ on whether this helper has been split out.
+    try:
+        from hermes_cli.web_server_profiles import _config_profile_scope
+    except ModuleNotFoundError as exc:
+        if exc.name != 'hermes_cli.web_server_profiles':
+            raise
+        from hermes_cli.web_server import _config_profile_scope
     return _config_profile_scope(profile)
 
 
